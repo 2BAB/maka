@@ -23,6 +23,7 @@ import { isPermissionMode, type PermissionMode } from '@maka/core/permission';
 import { isSessionStartMode, type SessionStartMode } from '@maka/core/session-start-mode';
 import {
   isSessionBlockedReason,
+  isSessionExecutionBackendId,
   isSessionToolProfile,
   type PersistedBackendKind,
   type SessionBlockedReason,
@@ -123,6 +124,7 @@ const PROJECTION_FIELDS = [
   'revisionOfTurnId',
   'revisionIndex',
   'revisionState',
+  'executionBackend',
   'thinkingLevel',
   'lastReadMessageId',
   'liveRunState',
@@ -157,6 +159,7 @@ export interface SessionCreateInput {
   readonly modelTarget: SessionModelTarget;
   readonly thinkingLevel?: ThinkingLevel;
   readonly toolProfile?: SessionToolProfile;
+  readonly executionBackend?: string;
   readonly permissionMode?: PermissionMode;
   readonly collaborationMode?: CollaborationMode;
   readonly orchestrationMode?: OrchestrationMode;
@@ -235,6 +238,7 @@ export interface SessionCatalogProjection {
   readonly revisionOfTurnId?: string;
   readonly revisionIndex?: number;
   readonly revisionState?: 'preparing' | 'committed';
+  readonly executionBackend?: string;
   readonly backend: PersistedBackendKind;
   readonly llmConnectionId: string | null;
   readonly llmConnectionSlug: string;
@@ -520,6 +524,7 @@ export function decodeSessionCreateInput(value: unknown): SessionCreateInput {
       'labels',
       'thinkingLevel',
       'toolProfile',
+      'executionBackend',
       'permissionMode',
       'collaborationMode',
       'orchestrationMode',
@@ -538,6 +543,9 @@ export function decodeSessionCreateInput(value: unknown): SessionCreateInput {
     ...(Object.hasOwn(input, 'toolProfile')
       ? { toolProfile: sessionToolProfile(input.toolProfile) }
       : {}),
+    ...(Object.hasOwn(input, 'executionBackend')
+      ? { executionBackend: sessionExecutionBackend(input.executionBackend) }
+      : {}),
     ...(Object.hasOwn(input, 'permissionMode')
       ? { permissionMode: permissionMode(input.permissionMode) }
       : {}),
@@ -552,6 +560,13 @@ export function decodeSessionCreateInput(value: unknown): SessionCreateInput {
 
 function sessionToolProfile(value: unknown): SessionToolProfile {
   if (!isSessionToolProfile(value)) throw invalidProtocolFrame('Invalid Session tool profile');
+  return value;
+}
+
+function sessionExecutionBackend(value: unknown): string {
+  if (!isSessionExecutionBackendId(value)) {
+    throw invalidProtocolFrame('Invalid Session execution backend');
+  }
   return value;
 }
 
@@ -759,6 +774,9 @@ export function decodeSessionCatalogProjection(value: unknown): SessionCatalogPr
     ...optionalEntityId(record, 'revisionOfTurnId'),
     ...optionalRevisionIndex(record),
     ...optionalRevisionState(record),
+    ...(Object.hasOwn(record, 'executionBackend')
+      ? { executionBackend: sessionExecutionBackend(record.executionBackend) }
+      : {}),
     backend: backend(record.backend),
     llmConnectionId:
       record.llmConnectionId === null

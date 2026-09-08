@@ -91,6 +91,7 @@ function createPlatform(
     ...(options.tools ? { tools: options.tools } : {}),
     ...(options.systemPrompt ? { systemPrompt: options.systemPrompt } : {}),
     ...(options.commands ? { commands: options.commands } : {}),
+    ...(options.sessionExecutors ? { sessionExecutors: options.sessionExecutors } : {}),
   });
   testPlatformInternals.set(platform, { composition, packages, store });
   return platform;
@@ -682,6 +683,58 @@ test('Plugin Platform query projects scoped Command contributions for clients', 
               name: 'review',
               description: 'Review the current change',
               aliases: ['rv'],
+            },
+          ],
+          nextCursor: null,
+        },
+      },
+    );
+    await platform.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Plugin Platform query projects Session execution backend contributions for clients', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'maka-plugin-executor-inspection-'));
+  try {
+    const platform = createPlatform(join(root, 'control'), {
+      sessionExecutors: {
+        inspect: () => [
+          {
+            entryId: 'executor-entry',
+            scopeId: 'profile',
+            extensionId: 'executor-package',
+            generation: 4,
+            id: 'codex',
+            label: 'Codex',
+            description: 'Run this Session with Codex',
+            capabilities: { stop: true },
+          },
+        ],
+      },
+    });
+    const coordinator = new HostPluginPlatformCoordinator(platform);
+    await platform.recover();
+    assert.deepEqual(
+      await coordinator.handlers['plugin.platform.query'](
+        { view: 'execution_backends', rootId: 'profile' },
+        null as never,
+      ),
+      {
+        ok: true,
+        result: {
+          view: 'execution_backends',
+          items: [
+            {
+              entryId: 'executor-entry',
+              scopeId: 'profile',
+              extensionId: 'executor-package',
+              generation: 4,
+              id: 'codex',
+              label: 'Codex',
+              description: 'Run this Session with Codex',
+              capabilities: { stop: true },
             },
           ],
           nextCursor: null,

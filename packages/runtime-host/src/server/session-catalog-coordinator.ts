@@ -182,6 +182,7 @@ export interface HostSessionCatalogCoordinatorOptions {
   readonly continuity: SessionContinuity;
   readonly workspaceResolver: HostWorkspaceResolver;
   readonly requestDrain: () => void;
+  readonly isExecutionBackendAvailable?: (sessionId: string, backendId: string) => boolean;
   readonly sessionAccessAuthority?: Pick<
     RuntimeHostAccessAuthority,
     'activeSessionGrantForPrincipal'
@@ -293,6 +294,7 @@ export class HostSessionCatalogCoordinator {
   readonly #continuity: SessionContinuity;
   readonly #workspaceResolver: HostWorkspaceResolver;
   readonly #requestDrain: () => void;
+  readonly #isExecutionBackendAvailable?: (sessionId: string, backendId: string) => boolean;
   readonly #sessionAccessAuthority:
     | Pick<RuntimeHostAccessAuthority, 'activeSessionGrantForPrincipal'>
     | undefined;
@@ -306,6 +308,7 @@ export class HostSessionCatalogCoordinator {
     this.#continuity = options.continuity;
     this.#workspaceResolver = options.workspaceResolver;
     this.#requestDrain = options.requestDrain;
+    this.#isExecutionBackendAvailable = options.isExecutionBackendAvailable;
     this.#sessionAccessAuthority = options.sessionAccessAuthority;
   }
 
@@ -358,6 +361,7 @@ export class HostSessionCatalogCoordinator {
 
   /** Prepare external facts before WorkHub commits create + assignment atomically. */
   async prepareWorkHubCreate(input: SessionCreateInput): Promise<CreateStableSessionRequest> {
+    this.#assertExecutionBackend(input);
     const prepared = await prepareCreate(input);
     return this.#workspaceResolver.runWithUsageRecorded(input.workspace, async (workspace) => {
       const [model, policy] = await Promise.all([
@@ -377,6 +381,9 @@ export class HostSessionCatalogCoordinator {
           model: model.model,
           ...(input.thinkingLevel === undefined ? {} : { thinkingLevel: input.thinkingLevel }),
           ...(input.toolProfile === undefined ? {} : { toolProfile: input.toolProfile }),
+          ...(input.executionBackend === undefined
+            ? {}
+            : { executionBackend: input.executionBackend }),
           permissionMode: prepared.permissionMode ?? policy.policy.chatDefaults.permissionMode,
           collaborationMode: input.collaborationMode ?? 'agent',
           orchestrationMode: input.orchestrationMode ?? 'default',
@@ -568,6 +575,7 @@ export class HostSessionCatalogCoordinator {
     }
     let prepared: PreparedSessionCreate;
     try {
+      this.#assertExecutionBackend(input);
       prepared = await prepareCreate(input);
     } catch (error) {
       return createOperationFailure(error, 'invalid_request');
@@ -609,6 +617,9 @@ export class HostSessionCatalogCoordinator {
               model: model.model,
               ...(input.thinkingLevel === undefined ? {} : { thinkingLevel: input.thinkingLevel }),
               ...(input.toolProfile === undefined ? {} : { toolProfile: input.toolProfile }),
+              ...(input.executionBackend === undefined
+                ? {}
+                : { executionBackend: input.executionBackend }),
               permissionMode: prepared.permissionMode ?? policy.policy.chatDefaults.permissionMode,
               collaborationMode: input.collaborationMode ?? 'agent',
               orchestrationMode: input.orchestrationMode ?? 'default',
@@ -645,6 +656,17 @@ export class HostSessionCatalogCoordinator {
         return createFailure('commit_outcome_unknown', 'Session creation outcome is unknown');
       }
     });
+  }
+
+  #assertExecutionBackend(input: SessionCreateInput): void {
+    const backendId = input.executionBackend;
+    if (!backendId || backendId === 'maka') return;
+    if (!this.#isExecutionBackendAvailable?.(input.sessionId, backendId)) {
+      throw new SessionOperationFailure(
+        'invalid_request',
+        `Session execution backend is unavailable: ${backendId}`,
+      );
+    }
   }
 
   #updateMetadata(
@@ -1290,6 +1312,7 @@ function createRequestFingerprint(
     prepared.permissionMode ?? ['runtime_default'],
     input.collaborationMode ?? 'agent',
     input.orchestrationMode ?? 'default',
+    ...(input.executionBackend ? [['execution_backend', input.executionBackend]] : []),
   ];
   return `sha256:${createHash('sha256').update(JSON.stringify(identity)).digest('hex')}`;
 }
@@ -1356,6 +1379,7 @@ export function projectSessionCatalogRecord(
     ...(header.revisionOfTurnId === undefined ? {} : { revisionOfTurnId: header.revisionOfTurnId }),
     ...(header.revisionIndex === undefined ? {} : { revisionIndex: header.revisionIndex }),
     ...(header.revisionState === undefined ? {} : { revisionState: header.revisionState }),
+    ...(header.executionBackend === undefined ? {} : { executionBackend: header.executionBackend }),
     backend: header.backend,
     llmConnectionId: header.llmConnectionId ?? null,
     llmConnectionSlug: header.llmConnectionSlug,

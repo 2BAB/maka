@@ -1283,6 +1283,7 @@ function buildSessionHeader(
     ...(input.revisionIndex !== undefined ? { revisionIndex: input.revisionIndex } : {}),
     ...(input.revisionState ? { revisionState: input.revisionState } : {}),
     hasUnread: false,
+    ...(input.executionBackend ? { executionBackend: input.executionBackend } : {}),
     backend: 'ai-sdk',
     ...(input.llmConnectionId === undefined ? {} : { llmConnectionId: input.llmConnectionId }),
     llmConnectionSlug: input.llmConnectionSlug,
@@ -1346,6 +1347,10 @@ export function normalizeSessionHeader(
     isValidSessionExternalOrigin(header.externalOrigin) &&
     (header.lastReadMessageId === undefined || typeof header.lastReadMessageId === 'string') &&
     typeof header.hasUnread === 'boolean' &&
+    (header.executionBackend === undefined ||
+      (typeof header.executionBackend === 'string' &&
+        header.executionBackend.length <= 128 &&
+        /^[a-z][a-z0-9]*(?:[-_.:][a-z0-9]+)*$/u.test(header.executionBackend))) &&
     isPersistedBackendKind(header.backend) &&
     (header.llmConnectionId === undefined ||
       (typeof header.llmConnectionId === 'string' && header.llmConnectionId.length > 0)) &&
@@ -1581,6 +1586,7 @@ function toSummary(header: SessionHeader): SessionSummary {
     ...(header.revisionOfTurnId ? { revisionOfTurnId: header.revisionOfTurnId } : {}),
     ...(header.revisionIndex !== undefined ? { revisionIndex: header.revisionIndex } : {}),
     ...(header.revisionState ? { revisionState: header.revisionState } : {}),
+    ...(header.executionBackend ? { executionBackend: header.executionBackend } : {}),
     backend: header.backend,
     ...(header.llmConnectionId === undefined ? {} : { llmConnectionId: header.llmConnectionId }),
     llmConnectionSlug: header.llmConnectionSlug,

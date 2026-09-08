@@ -85,6 +85,7 @@
     "./plugin-goal-service": "./dist/plugin-goal-service.js",
     "./plugin-lsp-service": "./dist/plugin-lsp-service.js",
     "./plugin-session-query-service": "./dist/plugin-session-query-service.js",
+    "./plugin-session-executor-service": "./dist/plugin-session-executor-service.js",
     "./plugin-shell-env-service": "./dist/plugin-shell-env-service.js",
     "./plugin-skill-service": "./dist/plugin-skill-service.js",
     "./plugin-agent-service": "./dist/plugin-agent-service.js",

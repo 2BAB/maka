@@ -551,6 +551,39 @@ test('creation rejects reserved execution labels before claiming a Session ident
   assert.equal(fixture.drainRequests(), 0);
 });
 
+test('creation accepts only a currently registered external Session executor', async () => {
+  const fixture = createFixture({
+    isExecutionBackendAvailable: (_sessionId, backendId) => backendId === 'codex',
+  });
+  const unavailable = await fixture.coordinator.handlers['session.create'](
+    {
+      sessionId: fixture.sessionId,
+      workspace: { kind: 'host_path', path: process.cwd() },
+      modelTarget: { kind: 'default' },
+      executionBackend: 'missing',
+    },
+    context,
+  );
+  assert.deepEqual(unavailable, {
+    ok: false,
+    error: {
+      code: 'invalid_request',
+      message: 'Session execution backend is unavailable: missing',
+    },
+  });
+
+  const accepted = await fixture.coordinator.handlers['session.create'](
+    {
+      sessionId: fixture.sessionId,
+      workspace: { kind: 'host_path', path: process.cwd() },
+      modelTarget: { kind: 'default' },
+      executionBackend: 'codex',
+    },
+    context,
+  );
+  assert.equal(accepted.ok, true);
+});
+
 test('ordinary creation rejects the reserved WorkHub Coordination Session identity', async () => {
   let probeAttempts = 0;
   const fixture = createFixture({
@@ -1706,6 +1739,7 @@ function createFixture(
     readonly projectCatalog?: ProjectCatalog;
     readonly onProjectChanged?: () => void;
     readonly legacyConnectionIdentity?: boolean;
+    readonly isExecutionBackendAvailable?: (sessionId: string, backendId: string) => boolean;
     readonly header?: Partial<SessionHeader>;
   } = {},
 ) {
@@ -1796,6 +1830,9 @@ function createFixture(
     requestDrain: () => {
       drains += 1;
     },
+    ...(options.isExecutionBackendAvailable
+      ? { isExecutionBackendAvailable: options.isExecutionBackendAvailable }
+      : {}),
   });
   return {
     coordinator,

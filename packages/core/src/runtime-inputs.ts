@@ -70,6 +70,8 @@ export interface CreateSessionInput {
   thinkingLevel?: ThinkingLevel;
   /** Immutable versioned prompt/tool contract for this Session. */
   toolProfile?: SessionToolProfile;
+  /** Plugin-contributed executor id. Omitted means the built-in Maka executor. */
+  executionBackend?: import('./session.js').SessionExecutionBackendId;
   permissionMode: PermissionMode;
   /** Defaults to `agent`. */
   collaborationMode?: CollaborationMode;

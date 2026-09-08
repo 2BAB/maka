@@ -232,6 +232,19 @@ export interface SessionExternalOrigin {
   readonly sourceSessionId: string;
 }
 
+export const DEFAULT_SESSION_EXECUTION_BACKEND = 'maka' as const;
+
+/** Stable plugin-contributed execution backend identity. */
+export type SessionExecutionBackendId = string;
+
+export function isSessionExecutionBackendId(value: unknown): value is SessionExecutionBackendId {
+  return (
+    typeof value === 'string' &&
+    value.length <= 128 &&
+    /^[a-z][a-z0-9]*(?:[-_.:][a-z0-9]+)*$/u.test(value)
+  );
+}
+
 export interface SessionHeader {
   // Identity
   id: string;
@@ -287,6 +300,8 @@ export interface SessionHeader {
   hasUnread: boolean;
 
   // Backend / model config
+  /** Absent on legacy/default rows; equivalent to {@link DEFAULT_SESSION_EXECUTION_BACKEND}. */
+  readonly executionBackend?: SessionExecutionBackendId;
   backend: PersistedBackendKind;
   /** Immutable Connection entity identity. Optional only on legacy Session records. */
   llmConnectionId?: string;
@@ -312,9 +327,12 @@ export interface SessionHeader {
   schemaVersion: 1;
 }
 
-export type SessionHeaderPatch = Partial<Omit<SessionHeader, 'isArchived' | 'role'>> & {
+export type SessionHeaderPatch = Partial<
+  Omit<SessionHeader, 'isArchived' | 'role' | 'executionBackend'>
+> & {
   readonly isArchived?: never;
   readonly role?: never;
+  readonly executionBackend?: never;
 };
 
 export function isWorkHubCoordinationSession(session: Pick<SessionHeader, 'role'>): boolean {
@@ -398,6 +416,8 @@ export interface SessionSummary {
   revisionOfTurnId?: string;
   revisionIndex?: number;
   revisionState?: 'preparing' | 'committed';
+  /** Absent means the built-in Maka executor. */
+  executionBackend?: SessionExecutionBackendId;
   backend: PersistedBackendKind;
   /** Immutable Connection entity identity. Optional only on legacy summaries. */
   llmConnectionId?: string;
@@ -933,6 +953,7 @@ export type WorkHubDelegationWorkspace =
 
 /** User-selected creation defaults; never applied to an existing Work. */
 export interface WorkHubCreateDefaults {
+  readonly executionBackend?: SessionExecutionBackendId;
   readonly model?: {
     readonly llmConnectionId: string;
     readonly llmConnectionSlug: string;
@@ -944,8 +965,12 @@ export interface WorkHubCreateDefaults {
 export function isWorkHubCreateDefaults(value: unknown): value is WorkHubCreateDefaults {
   if (
     !isRecord(value) ||
-    Object.keys(value).some((key) => key !== 'model' && key !== 'permissionMode')
+    Object.keys(value).some(
+      (key) => key !== 'executionBackend' && key !== 'model' && key !== 'permissionMode',
+    )
   )
+    return false;
+  if (value.executionBackend !== undefined && !isSessionExecutionBackendId(value.executionBackend))
     return false;
   if (value.permissionMode !== undefined && !isPermissionMode(value.permissionMode)) return false;
   if (value.model === undefined) return true;

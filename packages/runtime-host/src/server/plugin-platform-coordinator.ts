@@ -25,6 +25,7 @@ import {
 } from '@maka/runtime/plugin-runtime';
 import type { PluginToolInspection } from '@maka/runtime/plugin-tool-service';
 import type { PluginCommandInspection } from '@maka/runtime/plugin-command-service';
+import type { PluginSessionExecutorInspection } from '@maka/runtime/plugin-session-executor-service';
 import type {
   OperationOutcome,
   PluginPackageExportInput,
@@ -86,6 +87,16 @@ export class HostPluginPlatformCoordinator {
           return {
             ok: true,
             result: boundedPage('commands', this.platform.inspectCommands(input.rootId), input),
+          };
+        }
+        if (input.view === 'execution_backends') {
+          return {
+            ok: true,
+            result: boundedPage(
+              'execution_backends',
+              this.platform.inspectSessionExecutors(input.rootId),
+              input,
+            ),
           };
         }
         if (input.view === 'failures') {
@@ -197,12 +208,17 @@ function boundedPage(
   input: PluginPlatformQueryInput,
 ): Extract<PluginPlatformQueryResult, { readonly view: 'commands' }>;
 function boundedPage(
+  view: 'execution_backends',
+  values: readonly PluginSessionExecutorInspection[],
+  input: PluginPlatformQueryInput,
+): Extract<PluginPlatformQueryResult, { readonly view: 'execution_backends' }>;
+function boundedPage(
   view: 'failures',
   values: readonly PluginPlatformFailureProjection[],
   input: PluginPlatformQueryInput,
 ): Extract<PluginPlatformQueryResult, { readonly view: 'failures' }>;
 function boundedPage<T>(
-  view: 'packages' | 'entries' | 'tools' | 'commands' | 'failures',
+  view: 'packages' | 'entries' | 'tools' | 'commands' | 'execution_backends' | 'failures',
   values: readonly T[],
   input: PluginPlatformQueryInput,
 ): PluginPlatformQueryResult {
@@ -242,7 +258,7 @@ function boundedPage<T>(
 
 interface PageCursor {
   readonly version: 1;
-  readonly view: 'packages' | 'entries' | 'tools' | 'commands' | 'failures';
+  readonly view: 'packages' | 'entries' | 'tools' | 'commands' | 'execution_backends' | 'failures';
   readonly rootId?: string;
   readonly digest: string;
   readonly offset: number;

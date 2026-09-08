@@ -104,6 +104,7 @@ import {
 import { PluginGoalService } from '@maka/runtime/plugin-goal-service';
 import { PluginLspService } from '@maka/runtime/plugin-lsp-service';
 import { PluginSessionQueryService } from '@maka/runtime/plugin-session-query-service';
+import { PluginSessionExecutorService } from '@maka/runtime/plugin-session-executor-service';
 import { PluginShellEnvService } from '@maka/runtime/plugin-shell-env-service';
 import { PluginSkillService } from '@maka/runtime/plugin-skill-service';
 import { type RuntimeHostedRootAuthority } from '@maka/runtime/message-authority';
@@ -319,6 +320,7 @@ export async function createExecutionRuntimeHostComposition(
   let manager: SessionManager | undefined;
   let modelMetadataRefresh: ReturnType<typeof startHostModelMetadataRefresh> | undefined;
   let archiveEvidence: Awaited<ReturnType<typeof openToolResultArchiveEvidenceReader>> | undefined;
+  let invalidateSessionExecutors = (): void => undefined;
   try {
     const pluginRoot = new Context();
     const pluginAgents = new PluginAgentService(pluginRoot);
@@ -331,6 +333,9 @@ export async function createExecutionRuntimeHostComposition(
     const pluginShell = new PluginShellService(pluginRoot, pluginAgents, pluginShellEnv);
     const pluginWeb = new PluginWebService(pluginRoot, pluginAgents);
     const pluginSessionQuery = new PluginSessionQueryService(pluginRoot, pluginAgents);
+    const pluginSessionExecutors = new PluginSessionExecutorService(pluginRoot, pluginAgents, () =>
+      invalidateSessionExecutors(),
+    );
     const pluginGoals = new PluginGoalService(pluginRoot, pluginAgents);
     const pluginSkills = new PluginSkillService(pluginRoot);
     const pluginCommands = new PluginCommandService(pluginRoot);
@@ -350,6 +355,7 @@ export async function createExecutionRuntimeHostComposition(
       tools: pluginTools,
       systemPrompt: pluginSystemPrompt,
       commands: pluginCommands,
+      sessionExecutors: pluginSessionExecutors,
     });
     const pluginPlatformCoordinator = new HostPluginPlatformCoordinator(pluginPlatform);
     const openedProjectCatalog = storage.projectCatalog;
@@ -981,12 +987,17 @@ export async function createExecutionRuntimeHostComposition(
       runtimeCommitSink: stores.runtimeEventStore,
       requestDrain: context.requestDrain,
     });
-    backends.register(
-      'ai-sdk',
-      dependencies.primaryBackendFactory ?? {
-        prepare: (backendContext) => prepareHostAiSdkBackend(hostAiSdkBackendInput(backendContext)),
+    backends.register('ai-sdk', {
+      prepare: async (backendContext) => {
+        const executorId = backendContext.header.executionBackend ?? 'maka';
+        if (executorId !== 'maka') {
+          return pluginSessionExecutors.prepare(executorId, backendContext);
+        }
+        return dependencies.primaryBackendFactory
+          ? { build: dependencies.primaryBackendFactory }
+          : prepareHostAiSdkBackend(hostAiSdkBackendInput(backendContext));
       },
-    );
+    });
     const runtimeAuthority: RuntimeHostedRootAuthority = {
       bindRun: (identity) => messages.bindRun(identity),
       executeRoot: (input) =>
@@ -1333,6 +1344,7 @@ export async function createExecutionRuntimeHostComposition(
     const registerBackendInvalidation = (): void => {
       observeBackendInvalidation(requireSessionManager(manager).refreshIdleBackends());
     };
+    invalidateSessionExecutors = registerBackendInvalidation;
     const registerConfigurationMutation = (): void => {
       hostChanges.publishConfiguration();
       registerBackendInvalidation();
@@ -1837,6 +1849,8 @@ export async function createExecutionRuntimeHostComposition(
       continuity: continuityCoordinator,
       workspaceResolver,
       requestDrain: context.requestDrain,
+      isExecutionBackendAvailable: (sessionId, backendId) =>
+        pluginSessionExecutors.list(sessionId).some((executor) => executor.id === backendId),
       ...(context.sessionAccessAuthority
         ? { sessionAccessAuthority: context.sessionAccessAuthority }
         : {}),
@@ -2020,6 +2034,9 @@ export async function createExecutionRuntimeHostComposition(
                     : { kind: 'default' },
                   ...(input.create.defaults?.permissionMode
                     ? { permissionMode: input.create.defaults.permissionMode }
+                    : {}),
+                  ...(input.create.defaults?.executionBackend
+                    ? { executionBackend: input.create.defaults.executionBackend }
                     : {}),
                   collaborationMode: 'agent',
                   orchestrationMode: 'default',

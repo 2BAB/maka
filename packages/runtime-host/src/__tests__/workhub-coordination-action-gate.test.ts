@@ -1293,6 +1293,7 @@ describe('WorkHub Coordination Action Gate', () => {
         },
       ],
       newWorkDefaults: {
+        executionBackend: 'codex',
         model: { llmConnectionId: 'conn', llmConnectionSlug: 'test', model: 'chosen-model' },
         permissionMode: 'ask' as const,
       },

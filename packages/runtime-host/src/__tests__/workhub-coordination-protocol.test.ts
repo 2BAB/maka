@@ -528,6 +528,7 @@ test('WorkHub decodes attachment context and user-selected creation defaults wit
     proposal: { disposition: 'create_new', title: 'Audit' },
     create: { workspace: { kind: 'host_path', path: '/workspace' } },
     newWorkDefaults: {
+      executionBackend: 'codex',
       model: {
         llmConnectionId: 'connection-1',
         llmConnectionSlug: 'primary',

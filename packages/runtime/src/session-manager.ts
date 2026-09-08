@@ -4875,6 +4875,7 @@ export function headerToSummary(h: SessionHeader): SessionSummary {
     ...(h.revisionOfTurnId ? { revisionOfTurnId: h.revisionOfTurnId } : {}),
     ...(h.revisionIndex !== undefined ? { revisionIndex: h.revisionIndex } : {}),
     ...(h.revisionState ? { revisionState: h.revisionState } : {}),
+    ...(h.executionBackend ? { executionBackend: h.executionBackend } : {}),
     backend: h.backend,
     ...(h.llmConnectionId === undefined ? {} : { llmConnectionId: h.llmConnectionId }),
     llmConnectionSlug: h.llmConnectionSlug,

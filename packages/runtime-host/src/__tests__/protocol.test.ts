@@ -144,6 +144,10 @@ describe('Runtime Host bootstrap protocol', () => {
     assert.ok(RUNTIME_HOST_COMPATIBILITY_EPOCH > 95);
   });
 
+  test('publishes a new compatibility epoch for plugin Session execution backends', () => {
+    assert.ok(RUNTIME_HOST_COMPATIBILITY_EPOCH > 134);
+  });
+
   test('rejects the legacy connection update result in the current compatibility epoch', () => {
     assert.throws(
       () =>

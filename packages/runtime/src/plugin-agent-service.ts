@@ -177,6 +177,11 @@ export class PluginAgentService extends Service {
     return this.invocations.run(invocation, operation);
   }
 
+  /** Host adapter entry point for non-Tool execution providers. */
+  withInvocationContext<T>(invocation: PluginAgentInvocation, operation: () => T): T {
+    return this.invocations.run(Object.freeze({ ...invocation }), operation);
+  }
+
   current(): PluginAgent | undefined {
     const invocation = this.currentInvocation();
     if (!invocation) return undefined;

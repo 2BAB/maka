@@ -28,6 +28,7 @@ import {
 } from '@maka/runtime/plugin-runtime';
 import type { PluginToolInspection } from '@maka/runtime/plugin-tool-service';
 import type { PluginCommandInspection } from '@maka/runtime/plugin-command-service';
+import type { PluginSessionExecutorInspection } from '@maka/runtime/plugin-session-executor-service';
 import {
   requireCount,
   requireEncodedByteLimit,
@@ -88,7 +89,14 @@ export interface PluginPackageProjection {
 }
 
 export interface PluginPlatformQueryInput {
-  readonly view: 'status' | 'packages' | 'entries' | 'tools' | 'commands' | 'failures';
+  readonly view:
+    | 'status'
+    | 'packages'
+    | 'entries'
+    | 'tools'
+    | 'commands'
+    | 'execution_backends'
+    | 'failures';
   readonly rootId?: MakaPluginRootId;
   readonly cursor?: string;
   readonly limit?: number;
@@ -125,6 +133,11 @@ export type PluginPlatformQueryResult =
   | {
       readonly view: 'commands';
       readonly items: readonly PluginCommandInspection[];
+      readonly nextCursor: string | null;
+    }
+  | {
+      readonly view: 'execution_backends';
+      readonly items: readonly PluginSessionExecutorInspection[];
       readonly nextCursor: string | null;
     }
   | {
@@ -268,9 +281,15 @@ function decodePluginPlatformQueryInput(value: unknown): PluginPlatformQueryInpu
     ['rootId', 'cursor', 'limit'],
   );
   if (
-    !['status', 'packages', 'entries', 'tools', 'commands', 'failures'].includes(
-      input.view as string,
-    )
+    ![
+      'status',
+      'packages',
+      'entries',
+      'tools',
+      'commands',
+      'execution_backends',
+      'failures',
+    ].includes(input.view as string)
   ) {
     throw invalidProtocolFrame('Invalid Plugin Platform query view');
   }
@@ -292,9 +311,15 @@ function decodePluginPlatformQueryInput(value: unknown): PluginPlatformQueryInpu
   ) {
     throw invalidProtocolFrame('Plugin Platform status query does not accept paging');
   }
-  if (input.rootId !== undefined && view !== 'entries' && view !== 'tools' && view !== 'commands') {
+  if (
+    input.rootId !== undefined &&
+    view !== 'entries' &&
+    view !== 'tools' &&
+    view !== 'commands' &&
+    view !== 'execution_backends'
+  ) {
     throw invalidProtocolFrame(
-      'Plugin root identity is only valid for Entry, Tool, and Command queries',
+      'Plugin root identity is only valid for Entry, Tool, Command, and execution backend queries',
     );
   }
   let rootId: MakaPluginRootId | undefined;
@@ -367,7 +392,9 @@ function decodePluginPlatformQueryResult(value: unknown): PluginPlatformQueryRes
     if (
       !Array.isArray(output.items) ||
       output.items.length > 64 ||
-      !['packages', 'entries', 'tools', 'commands', 'failures'].includes(view as string)
+      !['packages', 'entries', 'tools', 'commands', 'execution_backends', 'failures'].includes(
+        view as string,
+      )
     ) {
       throw invalidProtocolFrame('Invalid Plugin Platform page');
     }
@@ -384,7 +411,9 @@ function decodePluginPlatformQueryResult(value: unknown): PluginPlatformQueryRes
             ? { view, items: output.items.map(decodeToolInspection), nextCursor }
             : view === 'commands'
               ? { view, items: output.items.map(decodeCommandInspection), nextCursor }
-              : { view: 'failures', items: output.items.map(decodePlatformFailure), nextCursor };
+              : view === 'execution_backends'
+                ? { view, items: output.items.map(decodeSessionExecutorInspection), nextCursor }
+                : { view: 'failures', items: output.items.map(decodePlatformFailure), nextCursor };
   }
   requireEncodedByteLimit(
     decoded,
@@ -415,6 +444,40 @@ function decodeCommandInspection(value: unknown): PluginCommandInspection {
     name: requireString(item.name, 'Plugin Command name', 128),
     description: requireString(item.description, 'Plugin Command description', 4096),
     aliases: item.aliases.map((alias) => requireString(alias, 'Plugin Command alias', 128)),
+  };
+}
+
+function decodeSessionExecutorInspection(value: unknown): PluginSessionExecutorInspection {
+  const item = requireShapedRecord(
+    value,
+    'Plugin Session executor inspection',
+    ['entryId', 'scopeId', 'extensionId', 'generation', 'id', 'label', 'capabilities'],
+    ['description'],
+  );
+  const capabilities = requireShapedRecord(
+    item.capabilities,
+    'Plugin Session executor capabilities',
+    [],
+    ['stop'],
+  );
+  for (const value of Object.values(capabilities)) {
+    if (typeof value !== 'boolean') {
+      throw invalidProtocolFrame('Invalid Plugin Session executor capability');
+    }
+  }
+  return {
+    entryId: requireId(item.entryId, 'Plugin Entry identity'),
+    scopeId: requireString(item.scopeId, 'Plugin scope identity', 256),
+    extensionId: requireId(item.extensionId, 'Plugin package identity'),
+    generation: requireCount(item.generation, 'Plugin generation'),
+    id: requireId(item.id, 'Plugin Session executor identity'),
+    label: requireString(item.label, 'Plugin Session executor label', 512),
+    ...(item.description === undefined
+      ? {}
+      : {
+          description: requireString(item.description, 'Plugin Session executor description', 4096),
+        }),
+    capabilities: capabilities as PluginSessionExecutorInspection['capabilities'],
   };
 }
 
