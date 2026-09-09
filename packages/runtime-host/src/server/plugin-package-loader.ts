@@ -93,7 +93,7 @@ export class TrustedPluginPackageLoader {
         );
       }
       if (!pkg.host) throw invalid('Trusted Host package must export a host Plugin');
-      const owned = freezeGeneration(pkg, generation);
+      const owned = freezeGeneration(pkg, generation, installed.contentDigest);
       this.#owned.add(generation);
       return owned;
     } catch (error) {
@@ -121,9 +121,14 @@ export class TrustedPluginPackageLoader {
   }
 }
 
-function freezeGeneration(pkg: MakaPluginPackage, generation: string): MakaPluginPackage {
+function freezeGeneration(
+  pkg: MakaPluginPackage,
+  generation: string,
+  contentDigest: string,
+): MakaPluginPackage {
   return Object.freeze({
     ...pkg,
+    contentDigest,
     [GENERATION_PATH]: generation,
     ...(pkg.contributions
       ? {

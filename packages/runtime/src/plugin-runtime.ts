@@ -25,6 +25,8 @@ export type MakaPluginRootId = 'profile' | 'desktop-ui' | `session:${string}`;
 
 export interface MakaPluginPackage {
   readonly packageId: string;
+  /** Host-verified digest of the installed package bytes. */
+  readonly contentDigest?: string;
   readonly host?: Plugin;
   readonly client?: Plugin;
   readonly contributions?: readonly MakaPluginContribution[];
@@ -333,6 +335,8 @@ export interface MakaPluginMetadata {
   readonly rootId: MakaPluginRootId;
   readonly entryId: string;
   readonly packageId: string;
+  readonly packageContentDigest?: string;
+  readonly entryConfigDigest?: `sha256:${string}`;
   readonly generation: number;
 }
 

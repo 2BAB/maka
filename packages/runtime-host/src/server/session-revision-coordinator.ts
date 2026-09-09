@@ -714,6 +714,9 @@ export class HostSessionRevisionCoordinator {
       ...(source.llmConnectionId === undefined ? {} : { llmConnectionId: source.llmConnectionId }),
       llmConnectionSlug: source.llmConnectionSlug,
       model: source.model,
+      ...(source.executionBackend !== undefined
+        ? { executionBackend: source.executionBackend }
+        : {}),
       ...(source.thinkingLevel !== undefined ? { thinkingLevel: source.thinkingLevel } : {}),
       permissionMode: source.permissionMode,
       collaborationMode: source.collaborationMode ?? 'agent',

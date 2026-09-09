@@ -34,6 +34,7 @@ import {
   validatePluginPackage,
   validatePluginRootId,
 } from './plugin-runtime.js';
+import { stableHash } from './request-shape.js';
 
 interface LiveEntry {
   spec: MakaCompositionEntry;
@@ -706,6 +707,8 @@ export class MakaCompositionLoader {
         rootId,
         entryId: spec.id,
         packageId: spec.packageId,
+        ...(pkg.contentDigest ? { packageContentDigest: pkg.contentDigest } : {}),
+        entryConfigDigest: stableHash(spec.config),
         generation,
       });
       context = context.extend({ maka: metadata });

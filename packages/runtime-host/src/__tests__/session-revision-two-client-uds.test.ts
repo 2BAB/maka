@@ -99,6 +99,7 @@ test('two Clients share exact retryable Session branch and revision authority', 
     archivedOwnedSourceSessionId,
     graphChildSessionId,
     continuationSourceSessionId,
+    backendSourceSessionId,
   } = await seedSource(root, capability);
   let host: ExecutionHostHandle | undefined;
   try {
@@ -113,6 +114,7 @@ test('two Clients share exact retryable Session branch and revision authority', 
       archivedOwnedSourceSessionId,
       graphChildSessionId,
       continuationSourceSessionId,
+      backendSourceSessionId,
     );
     await stopHost(host);
     host = undefined;
@@ -162,10 +164,24 @@ async function verifyConcurrentRevisionAuthority(
   archivedOwnedSourceSessionId: string,
   graphChildSessionId: string,
   continuationSourceSessionId: string,
+  backendSourceSessionId: string,
 ): Promise<void> {
   const desktop = await connectClient(root);
   const tui = await connectClient(root);
   try {
+    const backendSource = await querySession(desktop, backendSourceSessionId);
+    const backendCopy = await desktop.request('session.branch.create', {
+      sourceSessionId: backendSourceSessionId,
+      targetSessionId: 'backend-side-conversation-target',
+      expectedSourceRevision: backendSource.revision,
+      intent: 'side_conversation',
+    });
+    assert.equal(backendCopy.kind, 'committed');
+    if (backendCopy.kind !== 'committed') assert.fail('Backend copy must commit');
+    assert.equal(
+      requireSessionProjection(backendCopy.session).executionBackend,
+      'fixture-executor',
+    );
     const source = await querySession(desktop, sourceSessionId);
     for (const operation of ['session.branch.create', 'session.revision.create'] as const) {
       await assert.rejects(
@@ -802,6 +818,7 @@ async function seedSource(
   archivedOwnedSourceSessionId: string;
   graphChildSessionId: string;
   continuationSourceSessionId: string;
+  backendSourceSessionId: string;
 }> {
   const owner = await tryAcquireInteractiveRootOwner(capability);
   assert.ok(owner);
@@ -858,6 +875,15 @@ async function seedSource(
       llmConnectionSlug: 'fake',
       model: 'fake-model',
       permissionMode: 'ask',
+    });
+    const backendSource = await execution.sessionStore.create({
+      cwd: root,
+      name: 'External Backend Source Session',
+      llmConnectionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      llmConnectionSlug: 'fake',
+      model: 'fake-model',
+      permissionMode: 'ask',
+      executionBackend: 'fixture-executor',
     });
     const continuationParent = agentRunHeader(
       root,
@@ -1556,6 +1582,7 @@ async function seedSource(
       archivedOwnedSourceSessionId: archivedOwnedSource.id,
       graphChildSessionId: graphChild.header.id,
       continuationSourceSessionId: continuationSource.id,
+      backendSourceSessionId: backendSource.id,
     };
   } finally {
     graph.close();

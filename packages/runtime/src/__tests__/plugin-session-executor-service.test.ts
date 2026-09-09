@@ -139,6 +139,124 @@ test('Session executor registration is Profile-scoped and fail-closes on missing
   await root.fiber.dispose();
 });
 
+test('Session executor continuation identity binds package content and Entry config', async () => {
+  const identity = async (packageContentDigest: string, entryConfigDigest: `sha256:${string}`) => {
+    const root = new Context();
+    const agents = new PluginAgentService(root);
+    const executors = new PluginSessionExecutorService(root, agents);
+    const plugin = root.extend({
+      maka: {
+        rootId: 'profile' as const,
+        packageId: 'fixture',
+        packageContentDigest,
+        entryConfigDigest,
+        entryId: 'fixture',
+        generation: 1,
+      },
+    });
+    plugin.sessionExecutors.register({
+      id: 'codex',
+      label: 'Codex',
+      create: () => ({ run: async function* () {} }),
+    });
+    const header = sessionHeader({ executionBackend: 'codex' });
+    const result = executors.prepare('codex', {
+      sessionId: header.id,
+      workspaceRoot: header.workspaceRoot,
+      header,
+    }).providerStateIdentity;
+    await root.fiber.dispose();
+    return result;
+  };
+
+  const base = await identity('sha256-package-a', `sha256:${'1'.repeat(64)}`);
+  assert.notEqual(await identity('sha256-package-b', `sha256:${'1'.repeat(64)}`), base);
+  assert.notEqual(await identity('sha256-package-a', `sha256:${'2'.repeat(64)}`), base);
+  assert.equal(await identity('sha256-package-a', `sha256:${'1'.repeat(64)}`), base);
+});
+
+test('Session executor closes its iterator on exhaustion and early consumer exit', async () => {
+  for (const exit of ['exhausted', 'consumer'] as const) {
+    let returns = 0;
+    const { backend, close } = await executorBackend(() => ({
+      [Symbol.asyncIterator]() {
+        let emitted = false;
+        return {
+          next: async () => {
+            if (emitted) return { done: true as const, value: undefined };
+            emitted = true;
+            return {
+              done: false as const,
+              value: { type: 'text_delta' as const, text: 'partial' },
+            };
+          },
+          return: async () => {
+            returns += 1;
+            return { done: true as const, value: undefined };
+          },
+        };
+      },
+    }));
+    for await (const _event of backend.send({ turnId: 'turn-a', text: 'hello' })) {
+      if (exit === 'consumer') break;
+    }
+    assert.equal(returns, 1, exit);
+    await close();
+  }
+});
+
+test('Session executor contains iterator cleanup failure after one terminal outcome', async () => {
+  let returns = 0;
+  const { backend, close } = await executorBackend(() => ({
+    [Symbol.asyncIterator]() {
+      let emitted = false;
+      return {
+        next: async () => {
+          if (emitted) return { done: true as const, value: undefined };
+          emitted = true;
+          return { done: false as const, value: { type: 'complete' as const } };
+        },
+        return: async () => {
+          returns += 1;
+          throw new Error('cleanup failed');
+        },
+      };
+    },
+  }));
+  const events = [];
+  for await (const event of backend.send({ turnId: 'turn-a', text: 'hello' })) events.push(event);
+  assert.deepEqual(
+    events.map(({ type }) => type),
+    ['complete'],
+  );
+  assert.equal(returns, 1);
+  await close();
+});
+
+async function executorBackend(
+  run: () => AsyncIterable<
+    { readonly type: 'text_delta'; readonly text: string } | { readonly type: 'complete' }
+  >,
+) {
+  const root = new Context();
+  const agents = new PluginAgentService(root);
+  const executors = new PluginSessionExecutorService(root, agents);
+  const plugin = root.extend({
+    maka: { rootId: 'profile', packageId: 'fixture', entryId: 'fixture', generation: 1 },
+  });
+  plugin.sessionExecutors.register({ id: 'fixture', label: 'Fixture', create: () => ({ run }) });
+  const header = sessionHeader({ executionBackend: 'fixture' });
+  const backend = await executors
+    .prepare('fixture', { sessionId: header.id, workspaceRoot: header.workspaceRoot, header })
+    .build({
+      sessionId: header.id,
+      workspaceRoot: header.workspaceRoot,
+      header,
+      store: {} as never,
+    });
+  return { backend, close: () => root.fiber.dispose() };
+}
+
 function sessionHeader(patch: Partial<SessionHeader> = {}): SessionHeader {
   return {
     id: 'session-a',

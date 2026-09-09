@@ -136,6 +136,24 @@ test('composition metadata wins over same-named root Services', async () => {
   await loader.close();
 });
 
+test('composition metadata binds installed package content and Entry config', async () => {
+  const observed: Array<Context['maka']> = [];
+  const loader = new MakaCompositionLoader();
+  await loader.install({
+    packageId: 'identity-owner',
+    contentDigest: 'sha256-package-content',
+    host: (ctx: Context) => {
+      observed.push(ctx.maka);
+    },
+  });
+
+  await loader.create('profile', entry('identity-entry', 'identity-owner', { mode: 'strict' }));
+
+  assert.equal(observed[0]?.packageContentDigest, 'sha256-package-content');
+  assert.match(observed[0]?.entryConfigDigest ?? '', /^sha256:[a-f0-9]{64}$/u);
+  await loader.close();
+});
+
 test('config update uses the existing Fiber and preserves entry identity', async () => {
   const values: number[] = [];
   const plugin = (_ctx: Context, config: { value: number }) => {

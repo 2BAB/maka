@@ -96,6 +96,7 @@ export interface PluginSessionExecutorInspection
 
 interface RegisteredExecutor extends MakaContributionIdentity {
   readonly definition: PluginSessionExecutorDefinition;
+  readonly implementationIdentity: readonly [string, string];
   readonly token: symbol;
   retired: boolean;
 }
@@ -140,6 +141,10 @@ export class PluginSessionExecutorService extends Service {
             ...definition,
             capabilities: Object.freeze({ ...(definition.capabilities ?? {}) }),
           }),
+          implementationIdentity: Object.freeze([
+            this.ctx.maka?.packageContentDigest ?? `unverified-generation:${identity.generation}`,
+            this.ctx.maka?.entryConfigDigest ?? `unverified-config:${identity.generation}`,
+          ]),
           token: Symbol(definition.id),
           retired: false,
         };
@@ -173,7 +178,12 @@ export class PluginSessionExecutorService extends Service {
     if (!entry) throw new Error(`Session executor is unavailable: ${executorId}`);
     const providerStateIdentity = `sha256:${createHash('sha256')
       .update(
-        JSON.stringify([entry.extensionId, entry.entryId, entry.generation, entry.definition.id]),
+        JSON.stringify([
+          entry.extensionId,
+          entry.entryId,
+          ...entry.implementationIdentity,
+          entry.definition.id,
+        ]),
       )
       .digest('hex')}` as const;
     return {
@@ -219,6 +229,7 @@ class PluginSessionExecutorBackend implements AgentBackend {
       abortSignal: abort.signal,
     });
     let terminal = false;
+    let iterator: AsyncIterator<PluginSessionExecutorEvent> | undefined;
     try {
       const iterable = this.agents.withInvocationContext(invocation, () =>
         this.executor.run({
@@ -228,9 +239,12 @@ class PluginSessionExecutorBackend implements AgentBackend {
           signal: abort.signal,
         }),
       );
-      const iterator = iterable[Symbol.asyncIterator]();
+      const activeIterator = iterable[Symbol.asyncIterator]();
+      iterator = activeIterator;
       for (;;) {
-        const next = await this.agents.withInvocationContext(invocation, () => iterator.next());
+        const next = await this.agents.withInvocationContext(invocation, () =>
+          activeIterator.next(),
+        );
         if (next.done) break;
         const event = validateEvent(next.value);
         const ts = Date.now();
@@ -280,7 +294,6 @@ class PluginSessionExecutorBackend implements AgentBackend {
               stopReason: event.stopReason ?? 'end_turn',
             };
           }
-          await iterator.return?.();
           break;
         }
       }
@@ -328,6 +341,12 @@ class PluginSessionExecutorBackend implements AgentBackend {
         };
       }
     } finally {
+      try {
+        await this.agents.withInvocationContext(invocation, () => iterator?.return?.());
+      } catch {
+        // The provider already has a terminal outcome. Cleanup failures must not
+        // append a second terminal sequence or escape after a completed Turn.
+      }
       this.activeAborts.delete(abort);
     }
   }
