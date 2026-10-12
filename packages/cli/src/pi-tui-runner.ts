@@ -1254,6 +1254,36 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
       await Promise.allSettled([...pendingEnqueueTasks]);
     }
   };
+  // An in-flight retraction serializes navigation: a session switch waits
+  // for it, so the retracted text lands in the session it was asked for
+  // instead of being discarded after the driver re-keyed (#5109 review).
+  const pendingRetractionTasks = new Set<Promise<void>>();
+  const trackRetraction = (task: Promise<void>): void => {
+    pendingRetractionTasks.add(task);
+    void task.finally(() => pendingRetractionTasks.delete(task));
+  };
+  const settleRetractions = async (): Promise<void> => {
+    while (pendingRetractionTasks.size > 0) {
+      await Promise.allSettled([...pendingRetractionTasks]);
+    }
+  };
+  // A session switch re-keys the driver only partway through its work: the
+  // driver stops user commands and opens the target Session's channel before
+  // adopting the new id, and Shift+← stays live through that whole window. A
+  // retraction asked for there starts after the switch's `settleRetractions`
+  // drain yet still addresses the old Session — the Host removes the queued
+  // entries while the driver re-keys, and the switched-session fence then
+  // discards the returned text. New retractions are blocked for
+  // the entire switch instead (#5265 review).
+  let sessionSwitchesInFlight = 0;
+  const holdSwitchWindow = async <T>(body: () => Promise<T>): Promise<T> => {
+    sessionSwitchesInFlight += 1;
+    try {
+      return await body();
+    } finally {
+      sessionSwitchesInFlight -= 1;
+    }
+  };
 
   const requestTurnInterrupt = () => {
     // A detach in flight is not the running Turn's owner acting on it — the
@@ -1271,9 +1301,22 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
     // for re-editing, while anything already consumed stays in the transcript.
     // Serializing these operations also preserves that ordering over a Host
     // connection where both calls are asynchronous.
-    void (async () => {
+    const retractionTask = (async () => {
+      // Fence the retraction and the stop to the session they were asked for:
+      // a mid-turn `/session` landing while enqueues or the Host call are in
+      // flight re-keys the driver, and the abandoned retraction must neither
+      // retract the new session's queue nor stop its running turn, nor land
+      // its text there (#5109 review).
+      const retractionSessionId = input.driver.getSessionId();
       await settlePendingEnqueues();
-      const retracted = (await input.driver.retractQueued?.()) ?? { text: '', messageIds: [] };
+      if (input.driver.getSessionId() !== retractionSessionId) return;
+      const retracted = (await input.driver.retractQueued?.()) ?? {
+        text: '',
+        messageIds: [],
+      };
+      if (input.driver.getSessionId() !== retractionSessionId) {
+        return;
+      }
       acceptRetraction(retracted);
       requestRender();
       await input.driver.stop();
@@ -1282,6 +1325,7 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
       editor.disableSubmit = false;
       reportError(error);
     });
+    trackRetraction(retractionTask);
   };
 
   // Open a fresh turn from a submitted prompt (idle path). Control actions hold
@@ -1421,12 +1465,30 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
   // Shift+←: take back every queued message from the Runtime Host, joined and
   // prepended to the current draft for re-editing.
   const retractQueuedMessages = () => {
-    void (async () => {
+    // A session switch blocks new retractions for its entire window: the
+    // switch's own settle drain only covers retractions asked for before it,
+    // and past that drain a retraction would still address the old Session
+    // while the driver is busy re-keying (#5265 review). Swallowing the
+    // keypress loses nothing: the entries stay queued and Shift+← works once
+    // the switch lands.
+    if (sessionSwitchesInFlight > 0) return;
+    const retractionTask = (async () => {
+      // Same session fence as the interrupt path: a mid-turn `/session` that
+      // lands while enqueues or the retraction are in flight must neither
+      // retract the new session's queue nor inherit the text of the session
+      // we left (#5109 review).
+      const retractionSessionId = input.driver.getSessionId();
       await settlePendingEnqueues();
-      const retracted = (await input.driver.retractQueued?.()) ?? { text: '', messageIds: [] };
+      if (input.driver.getSessionId() !== retractionSessionId) return;
+      const retracted = (await input.driver.retractQueued?.()) ?? {
+        text: '',
+        messageIds: [],
+      };
+      if (input.driver.getSessionId() !== retractionSessionId) return;
       acceptRetraction(retracted);
       requestRender();
     })().catch(reportError);
+    trackRetraction(retractionTask);
   };
 
   // Onboarding wizard (#1098 UX redesign): one overlay spans provider search,
@@ -1886,7 +1948,11 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
   // The driver validates the durable cwd before adopting the resumed session.
   // A failure leaves the active session untouched and the next prompt still
   // lands on the old one.
-  const switchSession = async (sessionId: string, relocateCwd?: string) => {
+  const runSessionSwitch = async (sessionId: string, relocateCwd?: string) => {
+    // A session switch waits for an in-flight retraction: the retracted text
+    // must land in the session it was asked for before the driver re-keys
+    // (#5109 review).
+    await settleRetractions();
     resolvedInteractionIds.clear();
     const result = await input.driver.switchSession(
       sessionId,
@@ -1930,6 +1996,11 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
     }
     requestRender();
   };
+  // The whole switch — its settle drain, the driver's asynchronous re-key,
+  // and the adoption — runs inside the switch window so Shift+← cannot send a
+  // retraction for the session being left (#5265 review).
+  const switchSession = (sessionId: string, relocateCwd?: string): Promise<void> =>
+    holdSwitchWindow(() => runSessionSwitch(sessionId, relocateCwd));
 
   // Mid-turn `/session` switch-away (#3380): adopt another Session while a
   // Turn is still running on the current one. In Runtime Host mode the Turn is
@@ -1939,10 +2010,18 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
   // tail unwinds through the superseded branch and releases busy/activity,
   // then either that tail or the startPendingAttachedTurn below starts the
   // freshly attached Turn, whichever observes an idle runner first.
-  const switchAwayMidTurn = async (sessionId: string) => {
-    resolvedInteractionIds.clear();
+  const runMidTurnSwitch = async (sessionId: string) => {
+    // Reserve the detach before the retraction drain: every other navigation
+    // path (`/session`, the side toggle, a mid-turn side open) checks
+    // `detaching`, so the latch must be set before this await — two
+    // navigations could otherwise both pass their guard while the same drain
+    // is pending and then re-key the driver concurrently (#5265 review).
     detaching = true;
     try {
+      // Same serialization as the idle switch: the in-flight retraction lands
+      // its payload in the session it was asked for first (#5109 review).
+      await settleRetractions();
+      resolvedInteractionIds.clear();
       // Fence only after the driver confirms the switch: a failed switch must
       // leave the in-flight drain fully live. Events the abandoned queue
       // yields between the channel closing inside switchSession and
@@ -1983,6 +2062,10 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
       startPendingAttachedTurn();
     }
   };
+  // Same window as the idle switch: the mid-turn detach also re-keys the
+  // driver through asynchronous work, so Shift+← waits it out (#5265 review).
+  const switchAwayMidTurn = (sessionId: string): Promise<void> =>
+    holdSwitchWindow(() => runMidTurnSwitch(sessionId));
 
   const stopSideParentObserver = async (
     pair: NonNullable<typeof sideConversation>,
@@ -2038,11 +2121,16 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
     if (!pair || detaching || (busy && !turnRunning)) return;
     const fromSide = input.driver.getSessionId() === pair.sideSessionId;
     const targetSessionId = fromSide ? pair.parentSessionId : pair.sideSessionId;
-    const currentDraft = editor.getText();
     const switchView = async () => {
       if (turnRunning) await switchAwayMidTurn(targetSessionId);
       else await switchSession(targetSessionId);
       if (sideConversation !== pair) return;
+      // Capture after the switch: both switch paths drain a pending
+      // retraction first, and the drain may have restored text into the
+      // editor. Capturing before the wait would write that stale draft back
+      // over the recovery — side editor, parent editor, and Host queue all
+      // empty with no notice (#5265 review).
+      const currentDraft = editor.getText();
       if (fromSide) {
         pair.sideDraft = currentDraft;
         editor.setText(pair.parentDraft);
@@ -2063,6 +2151,13 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
   // running Turn, so the switch goes through the detach path instead of
   // silently no-oping on the busy gate.
   const goToSession = async (sessionId: string): Promise<boolean> => {
+    // One detach at a time (#3380, #5265 review): a second switch while the
+    // first is still handing the view over — including the retraction drain
+    // it waits in before re-keying — would clear `detaching` early, reopen
+    // the interrupt window, and double-apply the adoption. The idle branch
+    // is reachable mid-drain too (the running Turn can end while the detach
+    // waits), so the guard covers the whole command.
+    if (detaching) return false;
     const pair = sideConversation;
     if (
       pair &&
@@ -2083,10 +2178,6 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
       });
       return switched;
     }
-    // One detach at a time (#3380): a second mid-turn switch while the first
-    // is still handing the view over would clear `detaching` early, reopen
-    // the interrupt window, and double-apply the adoption.
-    if (detaching) return false;
     try {
       await switchAwayMidTurn(sessionId);
       if (leavesPair) await discardCurrentSidePair();
@@ -2098,6 +2189,12 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
   };
 
   const openSideConversation = async (prompt: string): Promise<void> => {
+    // One detach at a time (#5265 review): the running Turn can end while a
+    // mid-turn detach is still inside its retraction drain, making this
+    // command's idle branch reachable mid-drain — the open's re-key must not
+    // race the in-flight switch's, the same concurrent-re-key class
+    // `/session`'s guard closes.
+    if (detaching) return;
     if (sideConversation) {
       state.entries.push({
         kind: 'notice',
@@ -2119,6 +2216,13 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
     const previousActivity = currentActivityCompletion;
     let opened = false;
     const adopt = async () => {
+      // The window blocks only retractions asked inside it: one already in
+      // flight when the open started must drain here, while the driver still
+      // points at the parent — the Host removes the parent's queued entries as
+      // the retraction resolves, and a response landing after the re-key onto
+      // the side Session would be discarded by the side-session fence (#5265
+      // review).
+      await settleRetractions();
       const result = await input.driver.openSideConversation!();
       if (turnRunning) turnEpoch += 1;
       await applySwitchResult(result);
@@ -2126,8 +2230,14 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
         parentSessionId: result.parentSessionId,
         sideSessionId: result.sideSessionId,
         parentDraft: editor.getText(),
+        // The drain may have restored the parent's recovered text into the
+        // editor before the re-key; it is captured here, and the editor
+        // switches to the side view's own (empty) draft — pressing Enter here
+        // must not resubmit the parent's message inside the side conversation
+        // (#5265 review).
         sideDraft: '',
       };
+      editor.setText(sideConversation.sideDraft);
       await startSideParentObserver(sideConversation);
       opened = true;
       state.entries.push({
@@ -2137,11 +2247,17 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
       });
       requestRender();
     };
+    // Opening re-keys the driver onto the side Session through asynchronous
+    // work (the Host forks the parent and switches onto the fork), the same
+    // switchSession re-key path as `/session`, so both entry paths hold the
+    // switch window: a retraction asked inside it would address the parent
+    // while the Host removes its queued entries, and the side-session fence
+    // would then discard what the Host removed (#5265 review).
     if (turnRunning) {
       if (detaching) return;
       detaching = true;
       try {
-        await adopt();
+        await holdSwitchWindow(adopt);
       } catch (error) {
         reportError(error);
       } finally {
@@ -2149,22 +2265,51 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
         startPendingAttachedTurn();
       }
     } else {
-      await runControl(adopt);
+      await runControl(() => holdSwitchWindow(adopt));
     }
     if (!opened || !prompt) return;
     await previousActivity?.catch(() => undefined);
     submitPrompt(prompt);
   };
 
-  const closeSideConversation = async (): Promise<void> => {
+  const runCloseSideConversation = async (): Promise<void> => {
     const pair = sideConversation;
     if (!pair || !input.driver.closeSideConversation) return;
+    // Same drain as the open: a retraction asked while the side Session was
+    // active must land while the driver still points at it — past the re-key
+    // onto the parent, the close's session fence discards the text the Host
+    // already removed from the side queue (#5265 review).
+    await settleRetractions();
+    // The close is only admitted from an empty editor: recovered text in the
+    // editor is the only copy left, and closing here would overwrite it with
+    // the parent draft below or clear it on the switch. Aborting keeps it
+    // visible; a later Ctrl+C clears it like any draft (#5265 review).
+    if (editor.getText().length > 0) {
+      state.entries.push({
+        kind: 'notice',
+        level: 'info',
+        text: 'Side conversation kept open — the editor draft was kept.',
+      });
+      requestRender();
+      return;
+    }
     const result = await input.driver.closeSideConversation(
       pair.sideSessionId,
       pair.parentSessionId,
     );
     await applySwitchResult(result);
-    editor.setText(pair.parentDraft);
+    // The switch window only disabled submit: anything typed while the close
+    // was in flight is live user input and outranks the parked parent draft.
+    // Keep it — appending the parent draft below when both exist — instead of
+    // letting the restore silently drop it (#5265 review).
+    const liveDraft = editor.getText();
+    editor.setText(
+      liveDraft.length > 0
+        ? pair.parentDraft.length > 0
+          ? `${liveDraft}\n\n${pair.parentDraft}`
+          : liveDraft
+        : pair.parentDraft,
+    );
     await stopSideParentObserver(pair);
     sideConversation = undefined;
     if (result.cleanup === 'pending') {
@@ -2176,6 +2321,10 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
     }
     requestRender();
   };
+  // Same window as the open: closing re-keys the driver back onto the parent
+  // Session through its own asynchronous switch, so Shift+← waits it out
+  // (#5265 review).
+  const closeSideConversation = (): Promise<void> => holdSwitchWindow(runCloseSideConversation);
   const interruptAndCloseSideConversation = (): void => {
     if (interruptRequested) return;
     const completion = currentActivityCompletion;
@@ -2207,28 +2356,38 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
     state.entries.push(pendingNotice);
     requestRender();
     try {
-      const result = await input.driver.rewindToTurn(turnId).catch((error: unknown) => {
-        // The driver refuses rewind with a machine code when the selected
-        // turn carries structured context the TUI cannot restore (#5109).
-        // Render the localized catalog copy for that code instead of the
-        // driver's English fallback.
-        const code = (error as { code?: unknown })?.code;
-        if (
-          code === 'rewind_unsupported_quotes' ||
-          code === 'rewind_unsupported_attachments' ||
-          code === 'rewind_unsupported_directory_references'
-        ) {
-          const localized =
-            code === 'rewind_unsupported_quotes'
-              ? TUI_REWIND_COPY[locale].unsupportedQuotes
-              : code === 'rewind_unsupported_attachments'
-                ? TUI_REWIND_COPY[locale].unsupportedAttachments
-                : TUI_REWIND_COPY[locale].unsupportedDirectoryReferences;
-          throw new Error(localized);
-        }
-        throw error;
+      const result = await holdSwitchWindow(async () => {
+        // Same switch window as /session: rewind re-keys the driver through
+        // its own asynchronous branch-and-switch, and a retraction crossing
+        // that window would address the session being left (#5265 review).
+        // That window blocks only retractions asked inside it — one already in
+        // flight drains here, before the branch re-keys onto a fresh Session
+        // whose fence would otherwise discard the response (#5265 review).
+        await settleRetractions();
+        const rewind = await input.driver.rewindToTurn(turnId).catch((error: unknown) => {
+          // The driver refuses rewind with a machine code when the selected
+          // turn carries structured context the TUI cannot restore (#5109).
+          // Render the localized catalog copy for that code instead of the
+          // driver's English fallback.
+          const code = (error as { code?: unknown })?.code;
+          if (
+            code === 'rewind_unsupported_quotes' ||
+            code === 'rewind_unsupported_attachments' ||
+            code === 'rewind_unsupported_directory_references'
+          ) {
+            const localized =
+              code === 'rewind_unsupported_quotes'
+                ? TUI_REWIND_COPY[locale].unsupportedQuotes
+                : code === 'rewind_unsupported_attachments'
+                  ? TUI_REWIND_COPY[locale].unsupportedAttachments
+                  : TUI_REWIND_COPY[locale].unsupportedDirectoryReferences;
+            throw new Error(localized);
+          }
+          throw error;
+        });
+        await applySwitchResult(rewind);
+        return rewind;
       });
-      await applySwitchResult(result);
       await discardCurrentSidePair();
       // Record the discarded turn's prompt in the editor history before
       // deciding on the refill: prompts submitted in this TUI process are
@@ -3729,7 +3888,13 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
     );
   };
 
-  const newSession = async (): Promise<boolean> => {
+  const runNewSession = async (): Promise<boolean> => {
+    // A retraction already in flight when /new landed must drain here, while
+    // the driver still points at the session it was asked for: the Host has
+    // already removed the queued entries, so a response arriving after
+    // startNewSession's re-key would be discarded by the fresh-session fence
+    // (#5265 review).
+    await settleRetractions();
     try {
       await input.driver.startNewSession();
     } catch {
@@ -3767,6 +3932,19 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
     await discardCurrentSidePair();
     requestRender();
     return true;
+  };
+  const newSession = async (): Promise<boolean> => {
+    // `/new` must stay reachable while a Turn runs (#3210 review), so the busy
+    // lock never gates it — the end of the Turn does not either. A mid-turn
+    // detach's retraction-drain window leaves `detaching` as the only guard:
+    // startNewSession's re-key must not race the in-flight switch's (#5265
+    // review).
+    if (detaching) return false;
+    // Same switch window as `/session`: startNewSession re-keys the driver
+    // through asynchronous Host work, and a Shift+Left asked inside that
+    // window would address the session being replaced, whose entries the Host
+    // removes as the fresh Session is created (#5265 review).
+    return holdSwitchWindow(() => runNewSession());
   };
 
   const showHelp = () => {
