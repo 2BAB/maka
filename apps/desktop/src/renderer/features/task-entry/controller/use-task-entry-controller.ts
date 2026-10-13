@@ -521,7 +521,7 @@ export function useTaskEntryController(
           selectedProjectId: groupSelectedProjectId,
           onSelectProject: (projectId: string) => selectProject(host, projectId),
           ...(host.capabilities.chooseClientDirectory || host.capabilities.chooseHostDirectory
-            ? { onAdd: (name: string) => void addProjectForHost(host, name) }
+            ? { onAdd: (name?: string) => void addProjectForHost(host, name) }
             : {}),
           ...(host.capabilities.chooseClientDirectory
             ? { onRelink: (projectId: string) => void relinkProject(host, projectId) }
@@ -685,7 +685,8 @@ export function useTaskEntryController(
   const openNewProject = useCallback(() => setNewProjectOpen(true), []);
   const newProjectDialog = useMemo(() => newProjectOpen ? {
     close: () => setNewProjectOpen(false),
-    submit: (name: string) => addSelectedProject(name),
+    // An empty submit is "no name": the folder's basename will be used.
+    submit: (name?: string) => addSelectedProject(name),
   } : undefined, [newProjectOpen, addSelectedProject]);
   const openFolder = useCallback(async (
     folder: TaskEntryFolder,
