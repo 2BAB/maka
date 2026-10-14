@@ -1745,6 +1745,7 @@ export interface MakaBridge {
       | { ok: true; base64: string; mimeType: string }
       | { ok: false; reason: string }
     >;
+    resolveImageDelivery: import('@maka/core/image-delivery').ResolveImageDelivery;
     readBytes(sessionId: string, artifactId: string): Promise<ArtifactBinaryReadResult>;
   };
   search: {
