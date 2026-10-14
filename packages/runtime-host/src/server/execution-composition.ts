@@ -17,6 +17,8 @@
  * under the License.
  */
 
+import { markAssistantBackgroundSessions } from '../assistant/background-sessions.js';
+import { PersonalAssistantService, ASSISTANT_LEGACY_PACKAGES } from '../assistant/service.js';
 import { createAssistantMessageReader } from './session-transcript-reader.js';
 import { createImageFileReader } from '@maka/runtime/image-file-reader';
 import { ChatImageDeliveryService } from './chat-image-delivery.js';
@@ -42,6 +44,7 @@ import {
   type RuntimeInvocationRecord,
 } from '@maka/core/runtime-invocation';
 import {
+  ASSISTANT_BACKGROUND_SESSION_LABEL,
   type SessionHeader,
   type WorkHubDelegationAssignedMessage,
   WORKHUB_COORDINATION_SESSION_ID,
@@ -60,6 +63,7 @@ import {
   type BackendPreparationContext,
 } from '@maka/runtime/session-manager';
 import { buildToolsForAgentDefinition } from '@maka/runtime/agent-catalog';
+import { listRecallHistorySessions } from '@maka/core/recall';
 import { toolAvailabilityConnectorNames } from '@maka/runtime/tool-availability';
 import { buildRecallTools, type RecallToolDeps } from '@maka/runtime/recall-tools';
 import { RECALL_SYNTHETIC_TEXT_PATTERNS } from '@maka/runtime/recall-candidates';
@@ -110,6 +114,7 @@ import { PluginWebService } from '@maka/runtime/plugin-web-service';
 import { MakaCompositionLoader } from '@maka/runtime/plugin-composition-loader';
 import { PluginToolService } from '@maka/runtime/plugin-tool-service';
 import { PluginSystemPromptService } from '@maka/runtime/plugin-system-prompt-service';
+import { PluginTurnFinishService } from '@maka/runtime/plugin-turn-finish-service';
 import { PluginCommandService } from '@maka/runtime/plugin-command-service';
 import { PluginClientBridgeService } from '@maka/runtime/plugin-client-bridge-service';
 import {
@@ -120,6 +125,7 @@ import {
 } from '@maka/runtime/plugin-data-services';
 import { PluginGoalService } from '@maka/runtime/plugin-goal-service';
 import { PluginLspService } from '@maka/runtime/plugin-lsp-service';
+import { PluginSourceService } from '@maka/runtime/plugin-source-service';
 import { PluginSessionQueryService } from '@maka/runtime/plugin-session-query-service';
 import { PluginShellEnvService } from '@maka/runtime/plugin-shell-env-service';
 import { PluginSkillService } from '@maka/runtime/plugin-skill-service';
@@ -376,6 +382,7 @@ export async function createExecutionRuntimeHostComposition(
   let workspaceExecution: RuntimeHostWorkspaceExecutionComposition | undefined;
   let goalExecutions: HostGoalExecutionCoordinator | undefined;
   let pluginPlatform: HostPluginPlatform | undefined;
+  let assistant: PersonalAssistantService | undefined;
   let manager: SessionManager | undefined;
   let invalidatePluginExecutorBackends: () => void = () => undefined;
   let modelMetadataRefresh: ReturnType<typeof startHostModelMetadataRefresh> | undefined;
@@ -397,6 +404,7 @@ export async function createExecutionRuntimeHostComposition(
     const pluginShell = new PluginShellService(pluginRoot, pluginAgents, pluginShellEnv);
     const pluginWeb = new PluginWebService(pluginRoot, pluginAgents);
     const pluginSessionQuery = new PluginSessionQueryService(pluginRoot, pluginAgents);
+    const pluginSources = new PluginSourceService(pluginRoot, pluginAgents);
     const pluginGoals = new PluginGoalService(pluginRoot, pluginAgents);
     const pluginSkills = new PluginSkillService(pluginRoot);
     const pluginCommands = new PluginCommandService(pluginRoot);
@@ -412,7 +420,9 @@ export async function createExecutionRuntimeHostComposition(
     pluginCredentials.bindRuntime(pluginData);
     const pluginTools = new PluginToolService(pluginRoot, { agents: pluginAgents });
     const pluginSystemPrompt = new PluginSystemPromptService(pluginRoot);
+    const pluginTurnFinish = new PluginTurnFinishService(pluginRoot);
     pluginPlatform = new HostPluginPlatform(context.owner.controlDirectory, {
+      replacedPackages: ASSISTANT_LEGACY_PACKAGES,
       composition: new MakaCompositionLoader({ root: pluginRoot }),
       tools: pluginTools,
       systemPrompt: pluginSystemPrompt,
@@ -437,6 +447,44 @@ export async function createExecutionRuntimeHostComposition(
         return withBuiltinExternalAgentCatalog(catalog);
       },
     );
+
+    const personalAssistant = (assistant = new PersonalAssistantService(
+      join(context.owner.controlDirectory, 'personal-assistant'),
+      {
+        stopSessions: async () => {
+          if (!rootCoordinator) return;
+          const failures: unknown[] = [];
+          for (const session of await stores.sessionStore.listHeaders()) {
+            try {
+              const header = await stores.sessionStore.readHeaderSnapshot(session.id);
+              if (isAssistantSession(header))
+                await rootCoordinator.stopSession(session.id, { source: 'stop_button' });
+            } catch (error) {
+              failures.push(error);
+            }
+          }
+          if (failures.length)
+            throw new AggregateError(failures, 'Failed to stop assistant sessions');
+        },
+        markBackgroundSessions: (ids) => markAssistantBackgroundSessions(stores.sessionStore, ids),
+        agents: pluginAgents,
+        llm: pluginLlm,
+        sessionQuery: pluginSessionQuery,
+        sources: pluginSources,
+        resolveTools: (sessionId, core) => pluginTools.resolve(sessionId, core),
+      },
+    ));
+    const isAssistantSession = (header: { labels?: readonly string[] }) =>
+      header.labels?.some(
+        (label) => label === 'personal-assistant' || label === ASSISTANT_BACKGROUND_SESSION_LABEL,
+      ) ?? false;
+    const assertAssistantSessionEnabled = async (sessionId: string) => {
+      if (
+        !personalAssistant.enabled &&
+        isAssistantSession(await stores.sessionStore.readHeaderSnapshot(sessionId))
+      )
+        throw Error('Personal assistant is disabled; enable it in Settings');
+    };
     const openedProjectCatalog = storage.projectCatalog;
     const runtimePolicyStores = storage.runtimePolicy;
     const builtinExternalAgentPlugins = new HostBuiltinExternalAgentPluginCoordinator({
@@ -992,6 +1040,11 @@ export async function createExecutionRuntimeHostComposition(
           await requireRootCoordinator(rootCoordinator).readSessionHeader(sessionId);
         if (!projected || projected.unavailableReason) return projected;
         const header = await stores.sessionStore.readHeaderSnapshot(sessionId);
+        if (!personalAssistant.enabled && isAssistantSession(header))
+          return {
+            ...projected,
+            unavailableReason: 'Personal assistant is disabled; enable it in Settings',
+          };
         if (!header.executorId) return projected;
         const [entry] = await pluginExecutors.catalog({
           sessionId,
@@ -1224,6 +1277,10 @@ export async function createExecutionRuntimeHostComposition(
     });
     const hostAiSdkBackendInput = <T extends BackendPreparationContext>(backendContext: T) => ({
       context: backendContext,
+      beforeTurnFinish: async (turn: Parameters<typeof pluginTurnFinish.evaluate>[0]) => {
+        const decision = await personalAssistant.beforeFinish(turn);
+        return decision.allow ? pluginTurnFinish.evaluate(turn) : decision;
+      },
       runtimePolicy: runtimePolicyStores,
       oauthCredentials,
       createRunComposer: createInteractiveRunComposerFactory({
@@ -1239,10 +1296,15 @@ export async function createExecutionRuntimeHostComposition(
         goalTools: requireGoal(goal).tools,
         builtinTools,
         hostTools,
-        resolveRootTools: (sessionId) =>
-          sessionId === WORKHUB_COORDINATION_SESSION_ID && workHubResults && workHubInspection
-            ? Promise.resolve([workHubResults.tool, workHubInspection])
-            : requireGraphCoordinator(graphCoordinator).toolsForSession(sessionId),
+        resolveRootTools: async (sessionId) => {
+          await assertAssistantSessionEnabled(sessionId);
+          return [
+            ...personalAssistant.tools,
+            ...(sessionId === WORKHUB_COORDINATION_SESSION_ID && workHubResults && workHubInspection
+              ? [workHubResults.tool, workHubInspection]
+              : await requireGraphCoordinator(graphCoordinator).toolsForSession(sessionId)),
+          ];
+        },
         resolvePluginTools: (sessionId, coreTools) =>
           pluginTools.resolveContributions(sessionId, coreTools),
         resolvePluginSystemPrompt: async (sessionId, promptContext, baseText) => {
@@ -1254,10 +1316,17 @@ export async function createExecutionRuntimeHostComposition(
             },
             baseText,
           );
+          const native = await personalAssistant.prompt(
+            { sessionId, turnId: promptContext.turnId, cwd: promptContext.cwd },
+            assembly.text,
+          );
           return {
-            text: assembly.text,
-            contexts: assembly.contexts,
-            sourceRevisions: assembly.sourceRevision ? [assembly.sourceRevision] : [],
+            text: native.text,
+            contexts: [...assembly.contexts, ...native.contexts],
+            sourceRevisions: [
+              ...(assembly.sourceRevision ? [assembly.sourceRevision] : []),
+              ...(native.sourceRevision ? [native.sourceRevision] : []),
+            ],
           };
         },
         parentAgentTools: childAgentTools.parentTools,
@@ -1292,14 +1361,24 @@ export async function createExecutionRuntimeHostComposition(
       runtimeCommitSink: stores.runtimeEventStore,
       requestDrain: context.requestDrain,
     });
-    backends.register(
-      'ai-sdk',
-      dependencies.primaryBackendFactory ?? {
-        prepare: (backendContext) => prepareHostAiSdkBackend(hostAiSdkBackendInput(backendContext)),
+    backends.register('ai-sdk', {
+      prepare: async (backendContext) => {
+        await assertAssistantSessionEnabled(backendContext.sessionId);
+        const prepared = dependencies.primaryBackendFactory
+          ? { build: dependencies.primaryBackendFactory }
+          : await prepareHostAiSdkBackend(hostAiSdkBackendInput(backendContext));
+        return {
+          ...prepared,
+          build: async (factoryContext) => {
+            await assertAssistantSessionEnabled(factoryContext.sessionId);
+            return prepared.build(factoryContext);
+          },
+        };
       },
-    );
+    });
     backends.register('plugin-executor', {
       prepare: async (backendContext) => {
+        await assertAssistantSessionEnabled(backendContext.sessionId);
         const executorId = backendContext.header.executorId;
         if (!executorId) throw new Error('Plugin executor Session is missing its executor id');
         const binding = pluginExecutors.bind(backendContext.sessionId, executorId);
@@ -1407,9 +1486,10 @@ export async function createExecutionRuntimeHostComposition(
         requireClientCapabilities(clientCapabilities).snapshotForSession(sessionId);
       try {
         const [graphTools, planState] = await Promise.all([
-          sessionId === WORKHUB_COORDINATION_SESSION_ID && workHubResults && workHubInspection
+          (sessionId === WORKHUB_COORDINATION_SESSION_ID && workHubResults && workHubInspection
             ? Promise.resolve([workHubResults.tool, workHubInspection])
-            : requireGraphCoordinator(graphCoordinator).toolsForSession(sessionId),
+            : requireGraphCoordinator(graphCoordinator).toolsForSession(sessionId)
+          ).then((tools) => [...personalAssistant.tools, ...tools]),
           planStore.readState(sessionId),
         ]);
         const { runtimePolicy, surface } = await resolveInteractiveToolSurface({
@@ -1894,6 +1974,10 @@ export async function createExecutionRuntimeHostComposition(
       // Fresh WorkHub Turns use the coordinating Agent directly. Persisted
       // routing decisions remain readable for recovery of historical Turns.
       undefined,
+      (header) =>
+        !personalAssistant.enabled && isAssistantSession(header)
+          ? 'Personal assistant is disabled; enable it in Settings'
+          : undefined,
       (sessionId, event) => imageDelivery?.observe(sessionId, event),
     );
     const coordinator = rootCoordinator;
@@ -1945,6 +2029,10 @@ export async function createExecutionRuntimeHostComposition(
         id: session.id,
         ...(session.name ? { title: session.name } : {}),
         ...(session.cwd ? { cwd: session.cwd } : {}),
+        ...(session.labels?.length ? { labels: session.labels } : {}),
+        ...(session.model ? { model: session.model } : {}),
+        ...(session.llmConnectionSlug ? { llmConnectionSlug: session.llmConnectionSlug } : {}),
+        ...(session.executorId ? { executorId: session.executorId } : {}),
         ...(session.status ? { status: session.status } : {}),
         ...(session.parentSessionId ? { parentSessionId: session.parentSessionId } : {}),
         ...(session.statusUpdatedAt || session.lastMessageAt
@@ -1957,6 +2045,37 @@ export async function createExecutionRuntimeHostComposition(
       caller.invocation ??
       (caller.scopeSessionId ? Object.freeze({ sessionId: caller.scopeSessionId }) : undefined);
     pluginSessionQuery.bindRuntime({
+      historyList: async (caller) => {
+        if (!caller.invocation) throw new Error('History requires an Agent invocation');
+        return Promise.all(
+          (await listRecallHistorySessions(recallDeps, caller.invocation.sessionId)).map(
+            async (session) => ({
+              ...pluginSessionSummary(session),
+              historyRevision: await stores.runtimeEventStore.readSessionHistoryRevision(
+                session.id,
+              ),
+            }),
+          ),
+        );
+      },
+      historyRead: async (sessionId, caller) => {
+        if (!caller.invocation) throw new Error('History requires an Agent invocation');
+        const session = (
+          await listRecallHistorySessions(recallDeps, caller.invocation.sessionId)
+        ).find((item) => item.id === sessionId);
+        if (!session) return undefined;
+        const messages = await recallDeps.readMessages(sessionId, caller.invocation.abortSignal);
+        if (!messages)
+          throw new Error('History source unavailable; retry without advancing coverage');
+        // Recheck privacy after the asynchronous read before releasing its contents.
+        if (
+          !(await listRecallHistorySessions(recallDeps, caller.invocation.sessionId)).some(
+            (item) => item.id === sessionId,
+          )
+        )
+          return undefined;
+        return { session: pluginSessionSummary(session), messages };
+      },
       list: async (caller) =>
         Object.freeze(
           (await visibleAgentSessions(sessionQueryInitiator(caller))).map(pluginSessionSummary),
@@ -2014,9 +2133,18 @@ export async function createExecutionRuntimeHostComposition(
       placement: 'current_turn' | 'next_turn',
       initiator: import('@maka/runtime/plugin-agent-service').PluginAgentInvocation,
     ) => {
+      // Plugin activation precedes Root Turn recovery. A background timer must
+      // not admit a new root against the still-empty in-memory admission chain.
+      if (!rootRecoveryCompleted || draining) {
+        throw new Error(
+          'Runtime Host is not ready for Plugin Agent messages; retry after recovery',
+        );
+      }
       if (!(await visibleAgentSessions(initiator)).some((session) => session.id === id)) {
         throw new Error('Agent is outside the current ownership tree');
       }
+      initiator.abortSignal.throwIfAborted();
+      await assertAssistantSessionEnabled(id);
       const content = normalizeMessageContent(
         typeof message === 'string' ? { text: message } : (message as { text: string }),
       );
@@ -2040,6 +2168,43 @@ export async function createExecutionRuntimeHostComposition(
     };
     pluginAgents.bindRuntime({
       create: async (options, initiator) => {
+        if (options.background) {
+          if (
+            options.labels &&
+            (options.labels.length > 16 ||
+              options.labels.some(
+                (label) => typeof label !== 'string' || !label.trim() || label.length > 200,
+              ))
+          )
+            throw new Error(
+              'Background Session labels must contain at most 16 non-empty strings of at most 200 characters',
+            );
+          const parent = await stores.sessionStore.readHeaderSnapshot(initiator.sessionId);
+          const session = await requireSessionManager(manager).createSession(
+            {
+              cwd: parent.cwd,
+              name: options.name ?? 'Plugin background worker',
+              ...(options.labels ? { labels: [...options.labels] } : {}),
+              parentSessionId: parent.id,
+              llmConnectionSlug: parent.llmConnectionSlug,
+              ...(parent.llmConnectionId ? { llmConnectionId: parent.llmConnectionId } : {}),
+              ...(parent.model ? { model: parent.model } : {}),
+              ...(parent.thinkingLevel ? { thinkingLevel: parent.thinkingLevel } : {}),
+              permissionMode: parent.permissionMode,
+              ...(parent.executorId ? { executorId: parent.executorId } : {}),
+              ...(parent.toolMode ? { toolMode: parent.toolMode } : {}),
+            },
+            {
+              ...(initiator.executionBoundary
+                ? { initialBoundary: initiator.executionBoundary }
+                : {}),
+            },
+          );
+          hostChanges.publishSessionCatalog(session.id);
+          if (options.prompt)
+            await submitAgentMessage(session.id, options.prompt, 'next_turn', initiator);
+          return describeAgent(session);
+        }
         const spawn = initiator.toolContext?.spawnChildSession;
         if (!spawn) throw new Error('Agent creation requires an active Tool invocation');
         if (!options.prompt?.trim()) throw new Error('Agent creation requires a prompt');
@@ -2111,7 +2276,19 @@ export async function createExecutionRuntimeHostComposition(
       snapshot: async (id, initiator) => {
         const session = (await visibleAgentSessions(initiator)).find((item) => item.id === id);
         if (!session) throw new Error('Agent was not found');
-        return { agent: describeAgent(session), root: coordinator.readRootState(id) };
+        // A live root may be waiting on durable interaction while its Session still says running.
+        // Expose this through the generic plugin snapshot so background plugins can defer safely.
+        const pending = await stores.interactionStore.listPending({ sessionId: id });
+        const boundaries = await stores.sessionStore.listPendingSandboxBoundaryRequests(id);
+        const needsInput = pending.length > 0 || boundaries.length > 0;
+        return {
+          agent: {
+            ...describeAgent(session),
+            ...(needsInput ? { status: 'waiting_for_user' } : {}),
+          },
+          root: coordinator.readRootState(id),
+          pendingInteractions: pending.length + boundaries.length,
+        };
       },
       inbox: async (id, initiator) => {
         if (!(await visibleAgentSessions(initiator)).some((session) => session.id === id))
@@ -3004,6 +3181,35 @@ export async function createExecutionRuntimeHostComposition(
         ],
       }),
       createRuntimeHostDomainModule({
+        id: 'personal-assistant',
+        handlers: [
+          {
+            'personal-assistant.call': async (input) => {
+              try {
+                return {
+                  ok: true,
+                  result: { value: await personalAssistant.call(input.method, input.input) },
+                };
+              } catch (error) {
+                return {
+                  ok: false,
+                  error: {
+                    code: 'invalid_request',
+                    message: error instanceof Error ? error.message : String(error),
+                  },
+                };
+              }
+            },
+          },
+        ],
+        recovery: {
+          state: () => personalAssistant.recover(pluginData, pluginPlatform!.inspect('profile')),
+          schedulers: () => personalAssistant.start(),
+        },
+        drain: [() => personalAssistant.beginDrain()],
+        close: [() => personalAssistant.close()],
+      }),
+      createRuntimeHostDomainModule({
         id: 'builtin-external-agent-plugins',
         recovery: { state: () => builtinExternalAgentPlugins.recover() },
       }),
@@ -3402,6 +3608,7 @@ export async function createExecutionRuntimeHostComposition(
       errors.push(closeError);
     }
     try {
+      await assistant?.close();
       await pluginPlatform?.close();
     } catch (closeError) {
       errors.push(closeError);
