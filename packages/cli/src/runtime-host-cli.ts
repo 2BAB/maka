@@ -27,6 +27,7 @@ import {
   decodeRuntimeHostPosixOperatorCommand,
   decodeRuntimeHostWebRtcStunPolicy,
   type RuntimeHostManagedUpdatePolicy,
+  type RuntimeHostNodeOperatorCommand,
   type RuntimeHostPosixOperatorCommand,
   type RuntimeHostWebRtcStunPolicy,
 } from '@maka/runtime-host/operator';
@@ -149,6 +150,10 @@ export type RuntimeHostCliCommand =
       repairRootAfterRemount?: true;
       updateExisting?: true;
       reuseExistingEnvironment?: true;
+      expectedExisting?: {
+        readonly rootId: string;
+        readonly operator: RuntimeHostNodeOperatorCommand<'posix'>;
+      };
       allowInterruptActiveTasks?: true;
       clientDataRoot?: string;
       rootPath?: string;
@@ -725,12 +730,23 @@ function parseSetupCommand(argv: string[]): RuntimeHostCliCommand {
   let repairRootAfterRemount = false;
   let updateExisting = false;
   let reuseExistingEnvironment = false;
+  let expectedOperator: RuntimeHostNodeOperatorCommand<'posix'> | undefined;
   let allowInterruptActiveTasks = false;
   let clientDataRoot: string | undefined;
   let enableDirectPeer = false;
   const coordinationRelays: string[] = [];
   const options = parseManagedServiceOptions(argv, {
     valueOptions: {
+      '--expected-operator-json': (value) => {
+        if (expectedOperator) return error('Duplicate --expected-operator-json');
+        try {
+          const operator = decodeRuntimeHostPosixOperatorCommand(JSON.parse(value));
+          if (operator.kind !== 'node') return error('Expected a POSIX Node operator');
+          expectedOperator = operator;
+        } catch {
+          return error('--expected-operator-json must contain a POSIX Node operator');
+        }
+      },
       '--client-data-root': (value) => {
         if (clientDataRoot !== undefined) return error('Duplicate --client-data-root');
         if (!isSafeAbsolutePath(value)) return error('--client-data-root must be an absolute path');
@@ -790,6 +806,14 @@ function parseSetupCommand(argv: string[]): RuntimeHostCliCommand {
   });
   if ('kind' in options) return options;
   if (
+    (options.managedRootId !== undefined || expectedOperator !== undefined) &&
+    (!reuseExistingEnvironment || !options.managedRootId || !expectedOperator)
+  ) {
+    return error(
+      'Node recovery requires --reuse-existing-environment, --managed-root-id, and --expected-operator-json',
+    );
+  }
+  if (
     reuseExistingEnvironment &&
     ((lifecycle as string) !== 'on_demand' ||
       updateExisting ||
@@ -825,6 +849,9 @@ function parseSetupCommand(argv: string[]): RuntimeHostCliCommand {
     ...(repairRootAfterRemount ? { repairRootAfterRemount: true } : {}),
     ...(updateExisting ? { updateExisting: true } : {}),
     ...(reuseExistingEnvironment ? { reuseExistingEnvironment: true } : {}),
+    ...(expectedOperator
+      ? { expectedExisting: { rootId: options.managedRootId!, operator: expectedOperator } }
+      : {}),
     ...(allowInterruptActiveTasks ? { allowInterruptActiveTasks: true } : {}),
     ...(clientDataRoot ? { clientDataRoot } : {}),
     ...(enableDirectPeer ? { directPeer: { coordinationRelays } } : {}),
