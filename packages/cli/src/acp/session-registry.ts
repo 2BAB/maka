@@ -636,7 +636,12 @@ export class AcpSessionRegistry {
     } catch (error) {
       // Delivered between the read and the retract: the queue moved on, which
       // is the same answer to the client as an id that was never pending.
-      if (error instanceof RuntimeHostOperationError && error.code === 'not_found') {
+      // `not_found` is the entry that no longer exists; `operation_conflict` is
+      // the entry that became `in_flight` while this call was in the air.
+      if (
+        error instanceof RuntimeHostOperationError &&
+        (error.code === 'not_found' || error.code === 'operation_conflict')
+      ) {
         throw injectNotFound(params.messageId);
       }
       throw requestErrorFromRuntimeHost(error, 'queue.entry.retract');

@@ -76,7 +76,6 @@ export async function runMakaAcpStdioServer(
       // admissions with the epoch that no longer exists.
       Object.defineProperty(acpConnection, 'hostEpoch', {
         get: () => connection.hostEpoch,
-        enumerable: true,
         configurable: true,
       });
       return acpConnection;

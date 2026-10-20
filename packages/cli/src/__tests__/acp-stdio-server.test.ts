@@ -772,6 +772,67 @@ describe('Maka ACP stdio server', () => {
     assert.equal(harness.connectCalls(), 0);
   });
 
+  test('signs message admission with the current Host epoch after a replacement', async () => {
+    let epoch = 'host-1';
+    const submissions: Array<{ originHostEpoch?: unknown }> = [];
+    const connection = {
+      get hostEpoch() {
+        return epoch;
+      },
+      request: async (operation: string, input: unknown) => {
+        if (operation === 'session.create') return sessionProjection();
+        if (operation === 'connection.catalog.query') return connectionCatalogPage();
+        if (operation === 'turn.message.submit') {
+          submissions.push(input as { originHostEpoch?: unknown });
+          // A replacement Host owns everything after the first admission; the
+          // connection keeps reporting the new epoch from here on.
+          epoch = 'host-2';
+          return { disposition: 'steering' };
+        }
+        throw new Error(`Unexpected ${operation}`);
+      },
+      close: async () => undefined,
+    } as unknown as RuntimeHostConnection;
+    const stdin = new PassThrough();
+    const harness = createHarness([], { stdin, connection });
+    const run = harness.run();
+    const send = (id: number, method: string, params: unknown) =>
+      stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+    const outcome = (id: number) =>
+      (harness.stdoutMessages() as Array<{ id?: number; result?: { sessionId?: string } }>).find(
+        (message) => message.id === id,
+      );
+    try {
+      send(1, 'initialize', { protocolVersion: 1 });
+      await waitFor(() => Boolean(outcome(1)));
+      send(2, 'session/new', { cwd: '/workspace', mcpServers: [] });
+      await waitFor(() => Boolean(outcome(2)));
+      const sessionId = outcome(2)?.result?.sessionId;
+      assert.ok(sessionId);
+
+      send(3, 'session/inject', {
+        sessionId,
+        mode: 'steer',
+        content: [{ type: 'text', text: 'one' }],
+      });
+      await waitFor(() => submissions.length === 1);
+      send(4, 'session/inject', {
+        sessionId,
+        mode: 'steer',
+        content: [{ type: 'text', text: 'two' }],
+      });
+      await waitFor(() => submissions.length === 2);
+
+      assert.deepEqual(
+        submissions.map(({ originHostEpoch }) => originHostEpoch),
+        ['host-1', 'host-2'],
+      );
+    } finally {
+      stdin.end();
+      await run;
+    }
+  });
+
   test('returns a JSON-RPC parse error and then zero after EOF', async () => {
     const harness = createHarness(['not json\n']);
 
@@ -1128,25 +1189,31 @@ function createHarness(
           connectRuntimeHostCliConnection: async () => {
             connects += 1;
             if (options.connectError) throw options.connectError;
-            return {
-              connection: {
-                ...connection,
-                request: connection.request.bind(connection),
-                reconnecting: true,
-                hostEpoch: connection.hostEpoch ?? 'host-1',
-                openSessionSubscription:
-                  connection.openSessionSubscription?.bind(connection) ??
+            const acpConnection = {
+              ...connection,
+              request: connection.request.bind(connection),
+              reconnecting: true,
+              openSessionSubscription:
+                connection.openSessionSubscription?.bind(connection) ??
+                (async () => {
+                  throw new Error('Unexpected Session attachment');
+                }),
+              openSessionSubscriptionOnce: isRuntimeHostReconnectingConnection(connection)
+                ? connection.openSessionSubscriptionOnce.bind(connection)
+                : (connection.openSessionSubscription?.bind(connection) ??
                   (async () => {
                     throw new Error('Unexpected Session attachment');
-                  }),
-                openSessionSubscriptionOnce: isRuntimeHostReconnectingConnection(connection)
-                  ? connection.openSessionSubscriptionOnce.bind(connection)
-                  : (connection.openSessionSubscription?.bind(connection) ??
-                    (async () => {
-                      throw new Error('Unexpected Session attachment');
-                    })),
-                subscribeConnectionAvailability: () => () => undefined,
-              },
+                  })),
+              subscribeConnectionAvailability: () => () => undefined,
+            };
+            // Mirror the real reconnecting connection: the epoch changes when a
+            // new Host takes over, so the fixture has to stay live too.
+            Object.defineProperty(acpConnection, 'hostEpoch', {
+              get: () => connection.hostEpoch ?? 'host-1',
+              configurable: true,
+            });
+            return {
+              connection: acpConnection,
               close: () => connection.close(),
             } as unknown as Awaited<
               ReturnType<
