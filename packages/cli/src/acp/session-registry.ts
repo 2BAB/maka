@@ -106,6 +106,7 @@ import {
   AcpSessionConfigInputError,
   createAcpSessionConfigPatch,
   isAcpModelConfigOption,
+  offerableModelChoices,
   projectAcpSessionConfigOptions,
   validateAcpSessionConfigOptionRequest,
   type AcpSessionModelConfigContext,
@@ -2456,6 +2457,11 @@ export class AcpSessionRegistry {
         },
       );
     } catch (error) {
+      // A rejected value is the client's fault, not the Host's: the patch
+      // builder throws `AcpSessionConfigInputError` from inside the update
+      // callback, where the entry-point mapping in `setConfigOption` does not
+      // run. Without this it reaches the client as `internal_failure`.
+      if (error instanceof AcpSessionConfigInputError) throw requestErrorFromConfigInput(error);
       throw requestErrorFromSessionUpdate(error, 'session.configuration.update');
     }
     const configOptions = await this.#projectConfigOptions(connection, committed);
@@ -2515,24 +2521,18 @@ export class AcpSessionRegistry {
       ({ connectionId }) => connectionId === session.llmConnectionId,
     );
     const selectedModel = selectedConnection?.catalogEntries.find(({ id }) => id === session.model);
-    // Only models the connection has enabled are offerable: an entry that is in
-    // the resolved catalogue but not in `enabledModelIds` is rejected by the
-    // Host when selected, so listing it would advertise a dead choice.
-    const enabled = new Set(selectedConnection?.enabledModelIds ?? []);
-    const offerable = (selectedConnection?.catalogEntries ?? []).filter(
-      ({ id }) => enabled.has(id) || id === session.model,
-    );
     return projectAcpSessionConfigOptions(
       session,
       selectedModel?.thinkingLevels ?? [],
-      offerable.map(({ id, displayName }) => ({ id, name: displayName })),
+      offerableModelChoices(selectedConnection, session.model),
     );
   }
 
   /**
    * The session-scoped facts a model selection needs: which connection it runs
-   * on, which models that connection offers, and whether the connection is
-   * locked to the current model. Undefined means "cannot validate" — the
+   * on, and which of that connection's models it may select. The selection rule
+   * is shared with the picker (`offerableModelChoices`), so a value the client
+   * can see is a value this validates. Undefined means "cannot validate" — the
    * request is rejected rather than guessed.
    */
   async #modelConfigContext(
@@ -2548,11 +2548,7 @@ export class AcpSessionRegistry {
       connectionId: session.llmConnectionId,
       connectionSlug: session.llmConnectionSlug,
       currentModel: session.model,
-      connectionLocked: session.connectionLocked,
-      models: (entry?.catalogEntries ?? []).map(({ id, displayName }) => ({
-        id,
-        name: displayName,
-      })),
+      models: offerableModelChoices(entry, session.model),
     };
   }
 

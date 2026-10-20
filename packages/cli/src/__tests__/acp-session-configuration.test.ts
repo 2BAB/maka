@@ -24,6 +24,7 @@ import type { SessionCatalogProjection } from '@maka/runtime-host/protocol';
 import {
   AcpSessionConfigInputError,
   createAcpSessionConfigPatch,
+  offerableModelChoices,
   projectAcpSessionConfigOptions,
   validateAcpSessionConfigOptionRequest,
 } from '../acp/session-configuration.js';
@@ -214,7 +215,7 @@ test('rejects unsupported config ids, boolean values, and unsupported strings', 
 
 test('projects the session connection catalogue as model values', () => {
   const options = projectAcpSessionConfigOptions(
-    sessionProjection({ connectionLocked: false }),
+    sessionProjection(),
     [],
     [
       { id: 'gpt-5', name: 'GPT-5' },
@@ -230,9 +231,9 @@ test('projects the session connection catalogue as model values', () => {
   );
 });
 
-test('a locked connection offers only the model it already has', () => {
+test('a locked connection still offers its models: the lock binds the connection, not the model', () => {
   const options = projectAcpSessionConfigOptions(
-    sessionProjection(),
+    sessionProjection({ connectionLocked: true }),
     [],
     [
       { id: 'gpt-5', name: 'GPT-5' },
@@ -241,15 +242,17 @@ test('a locked connection offers only the model it already has', () => {
   );
   const modelOption = options[1];
   if (modelOption.type !== 'select') assert.fail('model option must be a select');
-  assert.deepEqual(modelOption.options, [{ value: 'gpt-5', name: 'GPT-5' }]);
+  assert.deepEqual(modelOption.options, [
+    { value: 'gpt-5', name: 'GPT-5' },
+    { value: 'o3', name: 'o3' },
+  ]);
 });
 
-test('maps a model selection to an explicit model target', () => {
+test('maps a model selection to an explicit model target and clears the thinking level', () => {
   const context = {
     connectionId: 'connection-1',
     connectionSlug: 'openai-main',
     currentModel: 'gpt-5',
-    connectionLocked: false,
     models: [{ id: 'gpt-5' }, { id: 'o3' }],
   } as const;
   assert.deepEqual(
@@ -264,16 +267,17 @@ test('maps a model selection to an explicit model target', () => {
         connectionSlug: 'openai-main',
         model: 'o3',
       },
+      // Carrying the old level over makes the Host refuse the new model.
+      thinkingLevel: null,
     },
   );
 });
 
-test('rejects a model the session cannot offer, and any change on a locked connection', () => {
+test('rejects a model the session cannot offer', () => {
   const context = {
     connectionId: 'connection-1',
     connectionSlug: 'openai-main',
     currentModel: 'gpt-5',
-    connectionLocked: false,
     models: [{ id: 'gpt-5' }],
   } as const;
   assert.throws(
@@ -284,18 +288,10 @@ test('rejects a model the session cannot offer, and any change on a locked conne
       ),
     AcpSessionConfigInputError,
   );
-  assert.throws(
-    () =>
-      createAcpSessionConfigPatch(
-        { sessionId: 'session-1', configId: 'model', value: 'o3' },
-        { ...context, connectionLocked: true },
-      ),
-    AcpSessionConfigInputError,
-  );
   assert.deepEqual(
     createAcpSessionConfigPatch(
       { sessionId: 'session-1', configId: 'model', value: 'gpt-5' },
-      { ...context, connectionLocked: true },
+      context,
     ),
     {
       modelTarget: {
@@ -304,7 +300,34 @@ test('rejects a model the session cannot offer, and any change on a locked conne
         connectionSlug: 'openai-main',
         model: 'gpt-5',
       },
+      thinkingLevel: null,
     },
+  );
+});
+
+test('offers and accepts only enabled models, plus the current one', () => {
+  assert.deepEqual(
+    offerableModelChoices(
+      {
+        catalogEntries: [
+          { id: 'gpt-5', displayName: 'GPT-5' },
+          { id: 'o3', displayName: 'o3' },
+          { id: 'o4', displayName: 'o4' },
+        ],
+        enabledModelIds: ['gpt-5', 'o3'],
+      },
+      'gpt-5',
+    ),
+    [
+      { id: 'gpt-5', name: 'GPT-5' },
+      { id: 'o3', name: 'o3' },
+    ],
+  );
+  // A session already running on a model the connection no longer enables keeps
+  // that model: hiding it would leave the picker without its own current value.
+  assert.deepEqual(
+    offerableModelChoices({ catalogEntries: [{ id: 'legacy' }], enabledModelIds: [] }, 'legacy'),
+    [{ id: 'legacy', name: 'legacy' }],
   );
 });
 

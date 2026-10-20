@@ -46,7 +46,6 @@ export interface AcpSessionModelConfigContext {
   readonly connectionId: string;
   readonly connectionSlug: string;
   readonly currentModel: string;
-  readonly connectionLocked: boolean;
   readonly models: readonly AcpModelChoice[];
 }
 
@@ -62,16 +61,37 @@ const MODEL_SPEC_NAME = 'Model';
 const MODEL_CATEGORY = 'model';
 
 /**
- * The values a session may select. A locked connection projects exactly the
- * model it already has: offering the rest and refusing every one of them would
- * advertise choices the client cannot take.
+ * The models a session may offer and accept from one connection: the ones that
+ * connection has enabled, plus whatever the session already runs on. One rule
+ * for the picker and for validation — the Host refuses a model it has not
+ * enabled, so offering it would advertise a dead choice.
  */
-function modelValues(
-  models: readonly AcpModelChoice[],
+export function offerableModelChoices(
+  connection:
+    | {
+        readonly catalogEntries: readonly { readonly id: string; readonly displayName?: string }[];
+        readonly enabledModelIds: readonly string[];
+      }
+    | undefined,
   currentModel: string,
-  locked: boolean,
-): string[] {
-  if (locked) return [currentModel];
+): AcpModelChoice[] {
+  const enabled = new Set(connection?.enabledModelIds ?? []);
+  return (connection?.catalogEntries ?? [])
+    .filter(({ id }) => enabled.has(id) || id === currentModel)
+    .map(({ id, displayName }) => ({ id, name: displayName ?? id }));
+}
+
+/**
+ * The values a session may select.
+ *
+ * A locked connection is locked to a **connection**, not to a model: the Host
+ * records `connectionLocked` on the first durable message and on every model
+ * change (`session-catalog-coordinator.ts`), and it does not refuse a
+ * same-connection switch afterwards. Collapsing the picker to `currentModel`
+ * would therefore leave one entry for the rest of the session, which is why the
+ * lock does not narrow this list.
+ */
+function modelValues(models: readonly AcpModelChoice[], currentModel: string): string[] {
   const offered = [...new Set(models.map(({ id }) => id).filter((id) => id.length > 0))];
   return offered.length > 0 ? offered : [currentModel];
 }
@@ -79,9 +99,8 @@ function modelValues(
 function modelOptions(
   models: readonly AcpModelChoice[],
   currentModel: string,
-  locked: boolean,
 ): readonly (readonly [string, string])[] {
-  return modelValues(models, currentModel, locked).map(
+  return modelValues(models, currentModel).map(
     (id) => [id, models.find((model) => model.id === id)?.name ?? id] as const,
   );
 }
@@ -159,7 +178,7 @@ export function projectAcpSessionConfigOptions(
         id: MODEL_CONFIG_ID,
         name: MODEL_SPEC_NAME,
         category: MODEL_CATEGORY,
-        options: modelOptions(models, session.model, session.connectionLocked),
+        options: modelOptions(models, session.model),
       },
       session.model,
     ),
@@ -224,13 +243,7 @@ export function validateAcpSessionConfigOptionRequest(
     if (!modelContext) throw new AcpSessionConfigInputError('configId', 'unsupported');
     if (typeof request.value !== 'string')
       throw new AcpSessionConfigInputError('value', 'invalid_type');
-    if (
-      !modelValues(
-        modelContext.models,
-        modelContext.currentModel,
-        modelContext.connectionLocked,
-      ).includes(request.value)
-    ) {
+    if (!modelValues(modelContext.models, modelContext.currentModel).includes(request.value)) {
       throw new AcpSessionConfigInputError('value', 'unsupported');
     }
     return;
@@ -259,6 +272,10 @@ export function createAcpSessionConfigPatch(
         connectionSlug: context.connectionSlug,
         model: request.value,
       },
+      // A thinking level belongs to the old model: the TUI's `setModel` sends
+      // the same `null` (runtime-host-session-driver.ts), and keeping it here
+      // makes the Host refuse any target model that does not support it.
+      thinkingLevel: null,
     };
   }
   switch (request.configId) {
