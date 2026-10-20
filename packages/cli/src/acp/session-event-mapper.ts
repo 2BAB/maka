@@ -130,9 +130,11 @@ export class AcpSessionEventMapper {
   acceptHistoricalMessage(message: StoredMessage): Promise<void> {
     return this.#enqueue(async () => {
       if (message.type === 'user') {
-        // ACP v1 has no mid-Turn steering update. Live projection omits these
-        // rows, so historical replay must not present them as new user turns.
-        if (message.steeringEventId) return;
+        // A steered message is still the user speaking: once it is delivered it
+        // belongs to the history, and `session/inject` gives the client the id
+        // it was acknowledged with. Dropping it would make a replay disagree
+        // with what the live turn showed.
+
         const attachments = message.attachments ?? [];
         const text = [
           userFacingText(message),
@@ -149,7 +151,9 @@ export class AcpSessionEventMapper {
             update: {
               sessionUpdate: 'user_message_chunk',
               content: { type: 'text', text },
-              messageId: message.id,
+              // The steering event id is the id `session/inject` returned;
+              // the stored row may carry its own id.
+              messageId: message.steeringEventId ?? message.id,
               ...(attachments.length || message.origin
                 ? {
                     _meta: {

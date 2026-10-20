@@ -658,7 +658,12 @@ describe('Maka ACP stdio server', () => {
           protocolVersion: 1,
           agentCapabilities: {
             loadSession: true,
-            sessionCapabilities: { list: {}, resume: {}, close: {} },
+            sessionCapabilities: {
+              list: {},
+              resume: {},
+              close: {},
+              inject: { modes: ['queue', 'steer'], steerInStream: ['finish'] },
+            },
             _meta: { '_maka/goalPlan': { version: 1 } },
           },
           authMethods: [],

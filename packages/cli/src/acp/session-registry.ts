@@ -111,6 +111,14 @@ import {
   validateAcpSessionConfigOptionRequest,
   type AcpSessionModelConfigContext,
 } from './session-configuration.js';
+import {
+  AcpInjectInputError,
+  decodeInjectRequest,
+  decodeRevokeRequest,
+  placementFor,
+  type InjectSessionRequest,
+  type RevokeInjectRequest,
+} from './session-inject.js';
 import { AcpSessionEventMapper } from './session-event-mapper.js';
 import { mapAcpPromptContent, publishAcpPromptAttachments } from './prompt-content.js';
 import { AcpSessionMcp, createAcpMcpConfig, type AcpMcpConnection } from './session-mcp.js';
@@ -158,6 +166,10 @@ function artifactUploadKey(sessionId: string, uploadId: string): string {
 }
 
 type AcpSessionRegistryOperation =
+  // Injected as `session/inject` / `session/revoke_inject`; the runtime names
+  // differ because delivery is a message submission, not a turn start.
+  | 'turn.message.submit'
+  | 'queue.retract'
   | 'connection.catalog.query'
   | 'session.create'
   | 'session.catalog.query'
@@ -193,6 +205,11 @@ export interface AcpSessionRegistryConnection
       | 'close'
     >,
     AcpMcpConnection {}
+
+/** The Runtime Host connection exposes its epoch; the ACP-side view does not. */
+function hostEpochOf(connection: AcpSessionRegistryConnection): string {
+  return (connection as AcpSessionRegistryConnection & { hostEpoch: string }).hostEpoch;
+}
 
 export interface AcpPromptContext {
   readonly signal: AbortSignal;
@@ -550,6 +567,74 @@ export class AcpSessionRegistry {
     this.#assertOpen('turn.start');
     this.#assertOwned(params.sessionId);
     return this.#track(this.#prompt(params, context));
+  }
+
+  /**
+   * `session/inject`: a user-role message delivered into the session without
+   * ending the current turn. `steer` is admitted into the running turn,
+   * `queue` waits for it to end. Both answer with the agent-owned message id.
+   *
+   * The response acknowledges admission, not delivery: the Host reports the
+   * delivered message in `session/load` replay, not on the live stream, so no
+   * live echo is emitted (see `session-inject.ts` for the scope note).
+   */
+  async inject(params: InjectSessionRequest): Promise<{ messageId: string }> {
+    this.#assertOpen('turn.message.submit');
+    this.#assertOwned(params.sessionId);
+    const content = await mapAcpPromptContent(
+      params.content as Parameters<typeof mapAcpPromptContent>[0],
+    );
+    const connection = await this.#getConnection('turn.message.submit');
+    const messageId = this.#newTurnId();
+    let disposition;
+    try {
+      const result = await connection.request('turn.message.submit', {
+        originHostEpoch: hostEpochOf(connection),
+        sessionId: params.sessionId,
+        messageId,
+        content,
+        placement: placementFor(params.mode),
+      });
+      disposition = result.disposition;
+    } catch (error) {
+      throw requestErrorFromRuntimeHost(error, 'turn.message.submit');
+    }
+    if (disposition === 'blocked') {
+      // Accepted is the contract; a blocked admission is not an acceptance.
+      throw RequestError.invalidParams(
+        { reason: 'inject_blocked' },
+        'Runtime Host blocked the injected message',
+      );
+    }
+    return { messageId };
+  }
+
+  /** `session/revoke_inject`: drops a pending injected message before delivery. */
+  async revokeInject(params: RevokeInjectRequest): Promise<Record<string, never>> {
+    this.#assertOpen('queue.retract');
+    this.#assertOwned(params.sessionId);
+    const connection = await this.#getConnection('queue.retract');
+    let retracted = false;
+    try {
+      const result = await connection.request('queue.retract', {
+        originHostEpoch: hostEpochOf(connection),
+        sessionId: params.sessionId,
+        retractId: params.messageId,
+      });
+      retracted = result.retracted.some((message) => message.messageId === params.messageId);
+    } catch (error) {
+      throw requestErrorFromRuntimeHost(error, 'queue.retract');
+    }
+    if (!retracted) {
+      // Either it was delivered already or the id was never ours; the proposal
+      // distinguishes these with -32010 / -32002, and the retract result is the
+      // only place we can tell them apart.
+      throw RequestError.invalidParams(
+        { reason: 'unknown_message_id', messageId: params.messageId },
+        'No pending injected message with this id',
+      );
+    }
+    return {};
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -2777,6 +2862,19 @@ function assertStringConfigValue(
   if (typeof params.value !== 'string') {
     throw new AcpSessionConfigInputError('value', 'invalid_type');
   }
+}
+
+export function requestErrorFromInjectInput(error: unknown): RequestError {
+  if (error instanceof AcpInjectInputError) {
+    return RequestError.invalidParams(
+      { field: error.field, reason: error.reason },
+      'Invalid Session injection request',
+    );
+  }
+  return RequestError.internalError(
+    { source: 'adapter', operation: 'session.inject', code: 'validation_failed' },
+    'Session injection validation failed',
+  );
 }
 
 function requestErrorFromConfigInput(error: unknown): RequestError {
