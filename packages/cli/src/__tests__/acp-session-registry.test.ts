@@ -6189,6 +6189,107 @@ describe('ACP Session registry', () => {
     await registry.dispose();
   });
 
+  test('revoking an injected message retracts that entry and leaves the rest queued', async () => {
+    const requests: Array<{ operation: string; input: unknown }> = [];
+    const connection = fakeConnection({
+      request: async (operation, input) => {
+        requests.push({ operation, input });
+        if (operation === 'session.create') return catalogSession('session-revoke');
+        if (operation === 'queue.entry.retract') return { queueRevision: 2 };
+        return {};
+      },
+      openSessionSubscriptionOnce: async () =>
+        ({
+          snapshot: {
+            queue: {
+              hostEpoch: 'host-1',
+              queueRevision: 1,
+              steering: [],
+              followup: [
+                queuedMessage('entry-a', 'message-a', 'A'),
+                queuedMessage('entry-b', 'message-b', 'B'),
+              ],
+            },
+          },
+          close: async () => undefined,
+        }) as never,
+    });
+    Object.assign(connection, { hostEpoch: 'host-1' });
+    const registry = new AcpSessionRegistry({
+      connect: async () => connection,
+      newSessionId: () => 'session-revoke',
+      newMutationId: () => 'mutation-1',
+    });
+    await registry.create({ cwd: TEST_CWD, mcpServers: [] });
+
+    await registry.revokeInject({ sessionId: 'session-revoke', messageId: 'message-a' });
+
+    assert.deepEqual(
+      requests.filter(({ operation }) => operation === 'queue.entry.retract'),
+      [
+        {
+          operation: 'queue.entry.retract',
+          input: {
+            originHostEpoch: 'host-1',
+            sessionId: 'session-revoke',
+            entryId: 'entry-a',
+            retractId: 'mutation-1',
+          },
+        },
+      ],
+    );
+    // The whole-queue operation would have taken B with it.
+    assert.deepEqual(
+      requests.filter(({ operation }) => operation === 'queue.retract'),
+      [],
+    );
+    await registry.dispose();
+  });
+
+  test('revoking an unknown message id mutates nothing', async () => {
+    const requests: Array<{ operation: string; input: unknown }> = [];
+    const connection = fakeConnection({
+      request: async (operation, input) => {
+        requests.push({ operation, input });
+        if (operation === 'session.create') return catalogSession('session-revoke');
+        return {};
+      },
+      openSessionSubscriptionOnce: async () =>
+        ({
+          snapshot: {
+            queue: {
+              hostEpoch: 'host-1',
+              queueRevision: 1,
+              steering: [queuedMessage('entry-a', 'message-a', 'A')],
+              followup: [queuedMessage('entry-b', 'message-b', 'B')],
+            },
+          },
+          close: async () => undefined,
+        }) as never,
+    });
+    Object.assign(connection, { hostEpoch: 'host-1' });
+    const registry = new AcpSessionRegistry({
+      connect: async () => connection,
+      newSessionId: () => 'session-revoke',
+    });
+    await registry.create({ cwd: TEST_CWD, mcpServers: [] });
+
+    await assert.rejects(
+      registry.revokeInject({ sessionId: 'session-revoke', messageId: 'message-gone' }),
+      (error: unknown) => {
+        assert.ok(error instanceof RequestError);
+        assert.equal(error.code, -32002);
+        assert.deepEqual(error.data, { messageId: 'message-gone' });
+        return true;
+      },
+    );
+    assert.deepEqual(
+      requests.filter(({ operation }) => operation.startsWith('queue.')),
+      [],
+    );
+    await registry.dispose();
+  });
+
   test('rereads the Session after one revision conflict before retrying', async () => {
     const requests: Array<{ operation: string; input: unknown }> = [];
     let reads = 0;
@@ -7478,6 +7579,20 @@ function catalogSession(
     orchestrationMode: 'default',
     ...overrides,
   };
+}
+
+function queuedMessage(
+  entryId: string,
+  messageId: string,
+  text: string,
+): {
+  entryId: string;
+  messageId: string;
+  content: { text: string };
+  placement: 'next_turn';
+  state: 'queued';
+} {
+  return { entryId, messageId, content: { text }, placement: 'next_turn', state: 'queued' };
 }
 
 function configOptions(

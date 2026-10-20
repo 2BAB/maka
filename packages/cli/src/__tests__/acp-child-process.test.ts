@@ -144,7 +144,13 @@ describe('Maka ACP child process', () => {
           protocolVersion: 1,
           agentCapabilities: {
             loadSession: true,
-            sessionCapabilities: { list: {}, resume: {}, close: {} },
+            sessionCapabilities: {
+              list: {},
+              resume: {},
+              close: {},
+              // Unstable injection proposal: declared, not part of v1.
+              inject: { modes: ['queue', 'steer'], steerInStream: ['finish'] },
+            },
             _meta: { '_maka/goalPlan': { version: 1 } },
           },
           authMethods: [],

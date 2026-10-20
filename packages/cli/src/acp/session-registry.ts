@@ -74,6 +74,7 @@ import {
   type OperationInput,
   type OperationOutput,
   type SessionCatalogProjection,
+  type SessionMessageQueueProjection,
   type TurnSnapshot,
   type TurnResumePlan,
   type SessionConversationCopyInput,
@@ -113,6 +114,7 @@ import {
 } from './session-configuration.js';
 import {
   AcpInjectInputError,
+  INJECT_NOT_FOUND,
   decodeInjectRequest,
   decodeRevokeRequest,
   placementFor,
@@ -169,7 +171,7 @@ type AcpSessionRegistryOperation =
   // Injected as `session/inject` / `session/revoke_inject`; the runtime names
   // differ because delivery is a message submission, not a turn start.
   | 'turn.message.submit'
-  | 'queue.retract'
+  | 'queue.entry.retract'
   | 'connection.catalog.query'
   | 'session.create'
   | 'session.catalog.query'
@@ -235,6 +237,7 @@ export interface AcpSessionRegistryOptions {
   readonly connect: (signal: AbortSignal) => Promise<AcpSessionRegistryConnection>;
   readonly newSessionId?: () => string;
   readonly newTurnId?: () => string;
+  readonly newMutationId?: () => string;
 }
 
 interface AcpAttachmentConfiguration {
@@ -266,6 +269,7 @@ export class AcpSessionRegistry {
   readonly #connect: (signal: AbortSignal) => Promise<AcpSessionRegistryConnection>;
   readonly #newSessionId: () => string;
   readonly #newTurnId: () => string;
+  readonly #newMutationId: () => string;
   readonly #inFlightOperations = new Set<Promise<unknown>>();
   readonly #ownedSessionIds = new Set<string>();
   readonly #mcps = new Map<string, AcpSessionMcp>();
@@ -309,6 +313,7 @@ export class AcpSessionRegistry {
     this.#connect = options.connect;
     this.#newSessionId = options.newSessionId ?? randomUUID;
     this.#newTurnId = options.newTurnId ?? randomUUID;
+    this.#newMutationId = options.newMutationId ?? randomUUID;
     this.#goalPlan = new AcpGoalPlanOperations({
       prepare: (sessionId, context, turnId, observe) =>
         this.#prepareGoalPlan(sessionId, context, turnId, observe),
@@ -611,30 +616,70 @@ export class AcpSessionRegistry {
 
   /** `session/revoke_inject`: drops a pending injected message before delivery. */
   async revokeInject(params: RevokeInjectRequest): Promise<Record<string, never>> {
-    this.#assertOpen('queue.retract');
+    this.#assertOpen('queue.entry.retract');
     this.#assertOwned(params.sessionId);
-    const connection = await this.#getConnection('queue.retract');
-    let retracted = false;
+    const connection = await this.#getConnection('queue.entry.retract');
+    const entryId = await this.#pendingEntryId(connection, params.sessionId, params.messageId);
+    if (entryId === undefined) {
+      // Nothing was touched: the id is either already delivered or was never
+      // admitted. `queue.retract` empties the whole queue before it can report
+      // the same thing, which is why revocation resolves the entry first.
+      throw injectNotFound(params.messageId);
+    }
     try {
-      const result = await connection.request('queue.retract', {
+      await connection.request('queue.entry.retract', {
         originHostEpoch: hostEpochOf(connection),
         sessionId: params.sessionId,
-        retractId: params.messageId,
+        entryId,
+        retractId: this.#newMutationId(),
       });
-      retracted = result.retracted.some((message) => message.messageId === params.messageId);
     } catch (error) {
-      throw requestErrorFromRuntimeHost(error, 'queue.retract');
-    }
-    if (!retracted) {
-      // Either it was delivered already or the id was never ours; the proposal
-      // distinguishes these with -32010 / -32002, and the retract result is the
-      // only place we can tell them apart.
-      throw RequestError.invalidParams(
-        { reason: 'unknown_message_id', messageId: params.messageId },
-        'No pending injected message with this id',
-      );
+      // Delivered between the read and the retract: the queue moved on, which
+      // is the same answer to the client as an id that was never pending.
+      if (error instanceof RuntimeHostOperationError && error.code === 'not_found') {
+        throw injectNotFound(params.messageId);
+      }
+      throw requestErrorFromRuntimeHost(error, 'queue.entry.retract');
     }
     return {};
+  }
+
+  /**
+   * The queue entry carrying `messageId`.
+   *
+   * Entry identity belongs to the Host: `entryId` and `messageId` are distinct
+   * fields, and `queue.retract`'s `retractId` names the mutation rather than
+   * the message, so a single revocation has to resolve the entry before it can
+   * use `queue.entry.retract`. The projection comes from the session's
+   * attachment when it has one, and from one read-only subscription otherwise.
+   */
+  async #pendingEntryId(
+    connection: AcpSessionRegistryConnection,
+    sessionId: string,
+    messageId: string,
+  ): Promise<string | undefined> {
+    const attached = await this.#attachments.get(sessionId)?.catch(() => undefined);
+    const queue = attached?.snapshot.queue ?? (await this.#readQueueOnce(connection, sessionId));
+    const pending = [...queue.steering, ...queue.followup];
+    return pending.find((entry) => entry.state === 'queued' && entry.messageId === messageId)
+      ?.entryId;
+  }
+
+  /** One queue read for a session owned by this connection but not attached. */
+  async #readQueueOnce(
+    connection: AcpSessionRegistryConnection,
+    sessionId: string,
+  ): Promise<SessionMessageQueueProjection> {
+    const subscription = await connection
+      .openSessionSubscriptionOnce({ sessionId, transcript: { kind: 'none' } })
+      .catch((error: unknown) => {
+        throw requestErrorFromRuntimeHost(error, 'subscription.open');
+      });
+    try {
+      return subscription.snapshot.queue;
+    } finally {
+      void subscription.close().catch(() => undefined);
+    }
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -2875,6 +2920,13 @@ export function requestErrorFromInjectInput(error: unknown): RequestError {
     { source: 'adapter', operation: 'session.inject', code: 'validation_failed' },
     'Session injection validation failed',
   );
+}
+
+/** Per the `session/inject` proposal: unknown or already-delivered message id. */
+function injectNotFound(messageId: string): RequestError {
+  return new RequestError(INJECT_NOT_FOUND, 'No pending injected message with this id', {
+    messageId,
+  });
 }
 
 function requestErrorFromConfigInput(error: unknown): RequestError {
