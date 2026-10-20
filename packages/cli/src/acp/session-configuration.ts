@@ -50,6 +50,13 @@ export interface AcpSessionModelConfigContext {
   readonly models: readonly AcpModelChoice[];
 }
 
+/**
+ * `model` is a category the ACP spec reserves for the model selector, alongside
+ * `mode`, `model_config` and `thought_level`
+ * (https://agentclientprotocol.com/protocol/v1/session-config-options#option-categories).
+ * Categories without a leading `_` belong to the spec, so this one is
+ * deliberately not namespaced like the `_maka/*` extensions below.
+ */
 const MODEL_CONFIG_ID = 'model';
 const MODEL_SPEC_NAME = 'Model';
 const MODEL_CATEGORY = 'model';
