@@ -331,6 +331,16 @@ test('offers and accepts only enabled models, plus the current one', () => {
   );
 });
 
+test('a Session without an LLM connection advertises no model option', () => {
+  const options = projectAcpSessionConfigOptions(sessionProjection({ llmConnectionId: null }), []);
+  // Validation refuses a model request without a catalogue, so projecting the
+  // option would offer a choice that can never be committed.
+  assert.deepEqual(
+    options.map(({ id }) => id),
+    ['permission_mode', 'collaboration_mode', 'orchestration_mode'],
+  );
+});
+
 test('a model request without a catalogue context is refused, not guessed', () => {
   assert.throws(
     () =>

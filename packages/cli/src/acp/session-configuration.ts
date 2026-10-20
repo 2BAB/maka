@@ -173,15 +173,23 @@ export function projectAcpSessionConfigOptions(
 ): SessionConfigOption[] {
   return [
     configOption(PERMISSION_SPEC, session.permissionMode),
-    configOption(
-      {
-        id: MODEL_CONFIG_ID,
-        name: MODEL_SPEC_NAME,
-        category: MODEL_CATEGORY,
-        options: modelOptions(models, session.model),
-      },
-      session.model,
-    ),
+    // A Session without an LLM connection (plugin executor) has no catalogue to
+    // choose from, and validation refuses a model request for exactly that
+    // reason. Projecting the option anyway would advertise a choice that cannot
+    // ever be committed.
+    ...(session.llmConnectionId === null
+      ? []
+      : [
+          configOption(
+            {
+              id: MODEL_CONFIG_ID,
+              name: MODEL_SPEC_NAME,
+              category: MODEL_CATEGORY,
+              options: modelOptions(models, session.model),
+            },
+            session.model,
+          ),
+        ]),
     ...(thinkingLevels.length === 0
       ? []
       : [
