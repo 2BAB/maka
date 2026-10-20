@@ -207,6 +207,15 @@ export class AcpSessionConfigInputError extends Error {
   }
 }
 
+/**
+ * Model values are session-scoped (they depend on the session's connection
+ * catalogue), so they cannot be validated without a context. Callers use this
+ * to defer them to the layer that has one.
+ */
+export function isAcpModelConfigOption(configId: string): boolean {
+  return configId === MODEL_CONFIG_ID;
+}
+
 export function validateAcpSessionConfigOptionRequest(
   request: SetSessionConfigOptionRequest,
   modelContext?: AcpSessionModelConfigContext,

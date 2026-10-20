@@ -105,6 +105,7 @@ import {
 import {
   AcpSessionConfigInputError,
   createAcpSessionConfigPatch,
+  isAcpModelConfigOption,
   projectAcpSessionConfigOptions,
   validateAcpSessionConfigOptionRequest,
   type AcpSessionModelConfigContext,
@@ -514,7 +515,11 @@ export class AcpSessionRegistry {
       );
     }
     try {
-      validateAcpSessionConfigOptionRequest(params);
+      // The model option is validated in #setConfigOption, where the session's
+      // own connection catalogue is available; here only the payload shape can
+      // be checked.
+      if (isAcpModelConfigOption(params.configId)) assertStringConfigValue(params);
+      else validateAcpSessionConfigOptionRequest(params);
     } catch (error) {
       throw requestErrorFromConfigInput(error);
     }
@@ -2763,6 +2768,14 @@ function validateNewSessionParams(
       { field: 'additionalDirectories', reason: 'unsupported' },
       'Additional directories are not supported by this ACP adapter yet',
     );
+  }
+}
+
+function assertStringConfigValue(
+  params: SetSessionConfigOptionRequest,
+): asserts params is SetSessionConfigOptionRequest & { readonly value: string } {
+  if (typeof params.value !== 'string') {
+    throw new AcpSessionConfigInputError('value', 'invalid_type');
   }
 }
 
