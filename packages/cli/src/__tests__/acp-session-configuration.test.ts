@@ -79,6 +79,7 @@ test('projects the ordered ACP configuration options', () => {
       ['ask', 'Ask'],
       ['bypass', 'Bypass'],
     ]),
+    selectOption('model', 'Model', 'model', 'gpt-5', [['gpt-5', 'gpt-5']]),
     selectOption('thinking_level', 'Thinking level', 'thought_level', 'default', [
       ['default', 'Default'],
       ['off', 'Off'],
@@ -117,7 +118,7 @@ test('projects canonical values and keeps reserved explore as a current value on
             ? { collaborationMode: value as SessionCatalogProjection['collaborationMode'] }
             : { orchestrationMode: value as SessionCatalogProjection['orchestrationMode'] };
       const option = projectAcpSessionConfigOptions(sessionProjection(overrides), ['low'])[
-        configId === 'permission_mode' ? 0 : configId === 'collaboration_mode' ? 2 : 3
+        configId === 'permission_mode' ? 0 : configId === 'collaboration_mode' ? 3 : 4
       ];
       assert.equal(option.currentValue, value);
     }
@@ -138,7 +139,7 @@ test('projects only the current model thinking levels and omits the switch when 
   const option = projectAcpSessionConfigOptions(
     sessionProjection({ thinkingLevel: 'high' }),
     levels,
-  )[1];
+  )[2];
   assert.deepEqual(
     option,
     selectOption('thinking_level', 'Thinking level', 'thought_level', 'high', [
@@ -150,7 +151,7 @@ test('projects only the current model thinking levels and omits the switch when 
   );
   assert.deepEqual(
     projectAcpSessionConfigOptions(sessionProjection(), []).map(({ id }) => id),
-    ['permission_mode', 'collaboration_mode', 'orchestration_mode'],
+    ['permission_mode', 'model', 'collaboration_mode', 'orchestration_mode'],
   );
 });
 
@@ -209,4 +210,112 @@ test('rejects unsupported config ids, boolean values, and unsupported strings', 
       },
     );
   }
+});
+
+test('projects the session connection catalogue as model values', () => {
+  const options = projectAcpSessionConfigOptions(
+    sessionProjection({ connectionLocked: false }),
+    [],
+    [
+      { id: 'gpt-5', name: 'GPT-5' },
+      { id: 'o3', name: 'o3' },
+    ],
+  );
+  assert.deepEqual(
+    options[1],
+    selectOption('model', 'Model', 'model', 'gpt-5', [
+      ['gpt-5', 'GPT-5'],
+      ['o3', 'o3'],
+    ]),
+  );
+});
+
+test('a locked connection offers only the model it already has', () => {
+  const options = projectAcpSessionConfigOptions(
+    sessionProjection(),
+    [],
+    [
+      { id: 'gpt-5', name: 'GPT-5' },
+      { id: 'o3', name: 'o3' },
+    ],
+  );
+  const modelOption = options[1];
+  if (modelOption.type !== 'select') assert.fail('model option must be a select');
+  assert.deepEqual(modelOption.options, [{ value: 'gpt-5', name: 'GPT-5' }]);
+});
+
+test('maps a model selection to an explicit model target', () => {
+  const context = {
+    connectionId: 'connection-1',
+    connectionSlug: 'openai-main',
+    currentModel: 'gpt-5',
+    connectionLocked: false,
+    models: [{ id: 'gpt-5' }, { id: 'o3' }],
+  } as const;
+  assert.deepEqual(
+    createAcpSessionConfigPatch(
+      { sessionId: 'session-1', configId: 'model', value: 'o3' },
+      context,
+    ),
+    {
+      modelTarget: {
+        kind: 'explicit',
+        connectionId: 'connection-1',
+        connectionSlug: 'openai-main',
+        model: 'o3',
+      },
+    },
+  );
+});
+
+test('rejects a model the session cannot offer, and any change on a locked connection', () => {
+  const context = {
+    connectionId: 'connection-1',
+    connectionSlug: 'openai-main',
+    currentModel: 'gpt-5',
+    connectionLocked: false,
+    models: [{ id: 'gpt-5' }],
+  } as const;
+  assert.throws(
+    () =>
+      createAcpSessionConfigPatch(
+        { sessionId: 'session-1', configId: 'model', value: 'o3' },
+        context,
+      ),
+    AcpSessionConfigInputError,
+  );
+  assert.throws(
+    () =>
+      createAcpSessionConfigPatch(
+        { sessionId: 'session-1', configId: 'model', value: 'o3' },
+        { ...context, connectionLocked: true },
+      ),
+    AcpSessionConfigInputError,
+  );
+  assert.deepEqual(
+    createAcpSessionConfigPatch(
+      { sessionId: 'session-1', configId: 'model', value: 'gpt-5' },
+      { ...context, connectionLocked: true },
+    ),
+    {
+      modelTarget: {
+        kind: 'explicit',
+        connectionId: 'connection-1',
+        connectionSlug: 'openai-main',
+        model: 'gpt-5',
+      },
+    },
+  );
+});
+
+test('a model request without a catalogue context is refused, not guessed', () => {
+  assert.throws(
+    () =>
+      createAcpSessionConfigPatch({
+        sessionId: 'session-1',
+        configId: 'model',
+        value: 'gpt-5',
+      }),
+    AcpSessionConfigInputError,
+  );
 });

@@ -107,6 +107,7 @@ import {
   createAcpSessionConfigPatch,
   projectAcpSessionConfigOptions,
   validateAcpSessionConfigOptionRequest,
+  type AcpSessionModelConfigContext,
 } from './session-configuration.js';
 import { AcpSessionEventMapper } from './session-event-mapper.js';
 import { mapAcpPromptContent, publishAcpPromptAttachments } from './prompt-content.js';
@@ -2430,12 +2431,17 @@ export class AcpSessionRegistry {
       committed = await updateRuntimeHostSession(
         connection,
         params.sessionId,
-        (current) =>
-          connection.request('session.configuration.update', {
+        async (current) => {
+          const modelContext =
+            params.configId === 'model'
+              ? await this.#modelConfigContext(connection, current)
+              : undefined;
+          return connection.request('session.configuration.update', {
             sessionId: params.sessionId,
             expectedRevision: current.revision,
-            patch: createAcpSessionConfigPatch(params),
-          }),
+            patch: createAcpSessionConfigPatch(params, modelContext),
+          });
+        },
         {
           operation: 'session.configuration.update',
           assertRequestAllowed: () => {
@@ -2504,7 +2510,41 @@ export class AcpSessionRegistry {
       ({ connectionId }) => connectionId === session.llmConnectionId,
     );
     const selectedModel = selectedConnection?.catalogEntries.find(({ id }) => id === session.model);
-    return projectAcpSessionConfigOptions(session, selectedModel?.thinkingLevels ?? []);
+    return projectAcpSessionConfigOptions(
+      session,
+      selectedModel?.thinkingLevels ?? [],
+      (selectedConnection?.catalogEntries ?? []).map(({ id, displayName }) => ({
+        id,
+        name: displayName,
+      })),
+    );
+  }
+
+  /**
+   * The session-scoped facts a model selection needs: which connection it runs
+   * on, which models that connection offers, and whether the connection is
+   * locked to the current model. Undefined means "cannot validate" — the
+   * request is rejected rather than guessed.
+   */
+  async #modelConfigContext(
+    connection: AcpSessionRegistryConnection,
+    session: SessionCatalogProjection,
+  ): Promise<AcpSessionModelConfigContext | undefined> {
+    if (session.llmConnectionId === null) return undefined;
+    const catalog = await readRuntimeHostConnectionCatalog(connection);
+    const entry = catalog.connections.find(
+      ({ connectionId }) => connectionId === session.llmConnectionId,
+    );
+    return {
+      connectionId: session.llmConnectionId,
+      connectionSlug: session.llmConnectionSlug,
+      currentModel: session.model,
+      connectionLocked: session.connectionLocked,
+      models: (entry?.catalogEntries ?? []).map(({ id, displayName }) => ({
+        id,
+        name: displayName,
+      })),
+    };
   }
 
   async #list(params: ListSessionsRequest): Promise<ListSessionsResponse> {
