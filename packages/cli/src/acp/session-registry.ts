@@ -2515,13 +2515,17 @@ export class AcpSessionRegistry {
       ({ connectionId }) => connectionId === session.llmConnectionId,
     );
     const selectedModel = selectedConnection?.catalogEntries.find(({ id }) => id === session.model);
+    // Only models the connection has enabled are offerable: an entry that is in
+    // the resolved catalogue but not in `enabledModelIds` is rejected by the
+    // Host when selected, so listing it would advertise a dead choice.
+    const enabled = new Set(selectedConnection?.enabledModelIds ?? []);
+    const offerable = (selectedConnection?.catalogEntries ?? []).filter(
+      ({ id }) => enabled.has(id) || id === session.model,
+    );
     return projectAcpSessionConfigOptions(
       session,
       selectedModel?.thinkingLevels ?? [],
-      (selectedConnection?.catalogEntries ?? []).map(({ id, displayName }) => ({
-        id,
-        name: displayName,
-      })),
+      offerable.map(({ id, displayName }) => ({ id, name: displayName })),
     );
   }
 
