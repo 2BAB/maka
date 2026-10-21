@@ -51,6 +51,12 @@
  *  - **Attachments are not published before admission.** `inject` maps content
  *    only, so a `resource_link` reaches the Host as a lazily read file
  *    reference, unlike `session/prompt`, which uploads before admitting.
+ *  - **A queued inject needs an observer for live output.** `queue` mode is
+ *    accepted on a Session created moments ago, before any prompt, load or
+ *    resume, and the Host does run it — but live delivery needs an attachment,
+ *    and this adapter opens one from those requests. A cold-Session queue
+ *    therefore completes invisibly and is readable afterwards through
+ *    `session/load`. Refusing it instead would drop work the Host can do.
  */
 
 export const SESSION_INJECT_METHOD = 'session/inject';
