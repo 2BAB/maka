@@ -292,6 +292,7 @@ export class AcpSessionRegistry {
   readonly #discardedAttachments = new WeakSet<RuntimeHostSessionChannel>();
   readonly #externalObservationContexts = new Map<string, AcpLoadContext>();
   readonly #externalContextLeases = new Map<string, AcpExternalContextLease>();
+  readonly #promptNotifications = new Map<string, AcpPromptContext['notify']>();
   readonly #sessionCloseTasks = new Map<string, Promise<CloseSessionResponse>>();
   readonly #artifactUploads = new Map<string, Map<string, ArtifactUploadTracking>>();
   readonly #artifactOperations = new Map<string, Set<Promise<unknown>>>();
@@ -1146,6 +1147,7 @@ export class AcpSessionRegistry {
         throw error;
       }
       active.attachment = attachment;
+      this.#promptNotifications.set(params.sessionId, context.notify);
       active.wake();
       if (active.cancelled) return { stopReason: await this.#cancelledStopReason(active) };
 
@@ -1233,7 +1235,11 @@ export class AcpSessionRegistry {
     const active = this.#admittedTurns(sessionId);
     const cancellations = active.map((prompt) => this.#cancelPrompt(prompt));
     for (const observation of this.#turnObservations.get(sessionId)?.values() ?? []) {
-      if (!(observation instanceof AcpAdmittedTurnObservation) && observation.stopTask) {
+      if (
+        !(observation instanceof AcpAdmittedTurnObservation) &&
+        !observation.readOnly &&
+        observation.stopTask
+      ) {
         cancellations.push(observation.stopTask);
       }
     }
@@ -1252,7 +1258,7 @@ export class AcpSessionRegistry {
               !active.some((prompt) => prompt.turnId === root.turnId)
             ) {
               const observation = this.#observation(sessionId, root.turnId);
-              if (observation && observation.attachment === opened) {
+              if (observation && observation.attachment === opened && !observation.readOnly) {
                 observation.stopTask ??= this.#stopAttachedTurn(opened, root);
                 await observation.stopTask;
               } else {
@@ -1278,9 +1284,14 @@ export class AcpSessionRegistry {
     )
       return Promise.resolve();
     const observation = this.#observation(root.sessionId, root.turnId);
-    if (observation && observation.runId !== undefined && observation.runId !== root.runId)
+    if (
+      observation &&
+      !observation.readOnly &&
+      observation.runId !== undefined &&
+      observation.runId !== root.runId
+    )
       return Promise.resolve();
-    if (observation && observation.attachment === attachment) {
+    if (observation && !observation.readOnly && observation.attachment === attachment) {
       observation.cancelled = true;
       observation.projectionAbort.abort();
       observation.reconciliationAbort.abort();
@@ -1480,20 +1491,25 @@ export class AcpSessionRegistry {
       client: context.interactions ?? UNAVAILABLE_INTERACTION_CLIENT,
       onPending: async (pending) => {
         const observation = this.#observation(sessionId, pending.turnId);
-        if (observation && !observation.cancelled) {
+        if (observation && !observation.readOnly && !observation.cancelled) {
           await observation.pendingInteraction(pending);
         }
       },
       onAnswered: (answered, pending) => attachment?.publishInteractionAnswer(answered, pending),
       onResolved: async (resolved, pending) => {
         const observation = this.#observation(sessionId, pending.turnId);
-        if (observation && !observation.cancelled && !observation.finished) {
+        if (
+          observation &&
+          !observation.readOnly &&
+          !observation.cancelled &&
+          !observation.finished
+        ) {
           await observation.resolvedInteraction(resolved, pending);
         }
       },
       onFailure: (pending, error) => {
         const observation = this.#observation(sessionId, pending.turnId);
-        if (observation?.attachment) {
+        if (observation?.attachment && !observation.readOnly) {
           if (!(observation instanceof AcpAdmittedTurnObservation)) {
             console.error('[acp] Attached interaction presentation failed:', error);
             return;
@@ -1510,7 +1526,8 @@ export class AcpSessionRegistry {
             void this.#cancelPrompt(active).catch(() => undefined);
           }
         }
-        if (!localPrompt && this.#observation(sessionId, pending.turnId)) {
+        const observation = this.#observation(sessionId, pending.turnId);
+        if (!localPrompt && observation && !observation.readOnly) {
           void this.#cancelSession(sessionId).catch(() => undefined);
         }
       },
@@ -1609,10 +1626,8 @@ export class AcpSessionRegistry {
       },
       onInteractionPending: (pending) => {
         if (attachment && this.#discardedAttachments.has(attachment)) return;
-        if (
-          !interactions.fencesTurn(pending.turnId) &&
-          !this.#observation(sessionId, pending.turnId)
-        ) {
+        const observation = this.#observation(sessionId, pending.turnId);
+        if (!interactions.fencesTurn(pending.turnId) && (!observation || observation.readOnly)) {
           // An idle attachment can observe another client's Turn; it does not
           // transfer that Turn's interaction authority to this ACP client.
           return;
@@ -1621,10 +1636,8 @@ export class AcpSessionRegistry {
       },
       onInteractionResolved: (pending) => {
         if (attachment && this.#discardedAttachments.has(attachment)) return;
-        if (
-          !interactions.fencesTurn(pending.turnId) &&
-          !this.#observation(sessionId, pending.turnId)
-        )
+        const observation = this.#observation(sessionId, pending.turnId);
+        if (!interactions.fencesTurn(pending.turnId) && (!observation || observation.readOnly))
           return;
         void interactions.resolved(pending);
       },
@@ -1751,6 +1764,7 @@ export class AcpSessionRegistry {
     this.#domainObservations.get(sessionId)?.dispose();
     this.#domainObservations.delete(sessionId);
     this.#attachmentConfigurations.delete(sessionId);
+    this.#promptNotifications.delete(sessionId);
     this.#attachments.delete(sessionId);
     return expected;
   }
@@ -1765,6 +1779,7 @@ export class AcpSessionRegistry {
     const cancellation = await this.#cancelSession(sessionId);
     this.#externalObservationContexts.delete(sessionId);
     this.#externalContextLeases.delete(sessionId);
+    this.#promptNotifications.delete(sessionId);
     for (const observation of this.#turnObservations.get(sessionId)?.values() ?? []) {
       if (!(observation instanceof AcpAdmittedTurnObservation)) {
         observation.dispose();
@@ -1827,8 +1842,9 @@ export class AcpSessionRegistry {
     initialTerminalTurn?: RuntimeHostTerminalTurn,
   ): Promise<AcpTurnObservation | undefined> {
     const context = this.#externalObservationContexts.get(sessionId);
+    const promptNotify = this.#promptNotifications.get(sessionId);
     if (
-      !context ||
+      (!context && !promptNotify) ||
       this.#closing ||
       this.#discardedAttachments.has(attachment) ||
       !this.#ownedSessionIds.has(sessionId)
@@ -1836,7 +1852,14 @@ export class AcpSessionRegistry {
       return;
     const existing = this.#observation(sessionId, turnId);
     if (existing) {
-      this.#replayPendingInteractions(sessionId, turnId, attachment, existing);
+      if (context && existing.readOnly) {
+        existing.readOnly = false;
+      }
+      await existing.startup;
+      if (this.#observation(sessionId, turnId) !== existing) return;
+      if (!existing.readOnly) {
+        this.#replayPendingInteractions(sessionId, turnId, attachment, existing);
+      }
       return existing;
     }
     const runId =
@@ -1849,10 +1872,13 @@ export class AcpSessionRegistry {
       sessionId,
       turnId,
       ...(runId === undefined ? {} : { runId }),
+      readOnly: !trackAdmission && !context,
       notify: async (notification) => {
-        const current = this.#externalObservationContexts.get(sessionId);
-        if (!this.#closing && this.#ownedSessionIds.has(sessionId) && current) {
-          await current.notify(notification);
+        const notify =
+          this.#externalObservationContexts.get(sessionId)?.notify ??
+          this.#promptNotifications.get(sessionId);
+        if (!this.#closing && this.#ownedSessionIds.has(sessionId) && notify) {
+          await notify(notification);
           this.#recordLiveHistoryDelivery(sessionId, notification, observation);
         }
       },
@@ -1862,99 +1888,112 @@ export class AcpSessionRegistry {
     const admission = observation instanceof AcpAdmittedTurnObservation ? observation : undefined;
     if (admission) this.#setTurnObservation(admission);
     else this.#setTurnObservation(observation);
-    try {
-      await observation.seed(attachment.messages);
-      if (
-        this.#observation(sessionId, turnId) !== observation ||
-        this.#closing ||
-        this.#discardedAttachments.has(attachment)
-      ) {
+    observation.transcript = attachment.trackPromptTranscript(turnId);
+    const startup = (async () => {
+      try {
+        await observation.seed(attachment.messages);
+        if (
+          this.#observation(sessionId, turnId) !== observation ||
+          this.#closing ||
+          this.#discardedAttachments.has(attachment)
+        ) {
+          observation.dispose();
+          if (admission) this.#removeTurnObservation(admission);
+          else this.#removeTurnObservation(observation);
+          return undefined;
+        }
+        const task = observation.start(attachment);
+        if (!observation.readOnly) {
+          this.#replayPendingInteractions(sessionId, turnId, attachment, observation);
+        }
+        const interactions = this.#attachmentInteractions.get(sessionId);
+        void task
+          .then(
+            async () => {
+              if (
+                observation.finished ||
+                this.#observation(sessionId, turnId) !== observation ||
+                this.#discardedAttachments.has(attachment)
+              )
+                return;
+              const root = observation.terminalTurn;
+              const outcome = root ?? observation.terminalOutcome;
+              const runId = root?.runId ?? observation.runId;
+              if (outcome && runId) {
+                await this.#externalObservationContexts.get(sessionId)?.notifyTurnStatus?.({
+                  sessionId,
+                  turnId,
+                  runId,
+                  status: outcome.status,
+                  ...(outcome.status === 'failed'
+                    ? { failureClass: outcome.failureClass ?? 'runtime_error' }
+                    : {}),
+                });
+              }
+            },
+            async (error: unknown) => {
+              if (
+                !this.#closing &&
+                !observation.finished &&
+                this.#observation(sessionId, turnId) === observation &&
+                !this.#discardedAttachments.has(attachment)
+              ) {
+                console.error('[acp] Attached Turn observation failed:', error);
+                const root = attachment.snapshot.rootTurn;
+                if (
+                  !observation.readOnly &&
+                  root?.turnId === turnId &&
+                  (observation.runId === undefined || root.runId === observation.runId) &&
+                  !isRuntimeHostTerminalTurn(root)
+                ) {
+                  observation.stopTask ??= this.#stopAttachedTurn(attachment, root);
+                  void observation.stopTask.catch((stopError: unknown) => {
+                    console.error('[acp] Host Stop delivery failed:', stopError);
+                  });
+                }
+                await this.#externalObservationContexts.get(sessionId)?.notifyTurnStatus?.({
+                  sessionId,
+                  turnId,
+                  runId: root?.turnId === turnId ? root.runId : '',
+                  status: 'observation_failed',
+                });
+              }
+            },
+          )
+          .catch((error: unknown) => {
+            console.error('[acp] Attached Turn status delivery failed:', error);
+          })
+          .finally(async () => {
+            if (admission) {
+              while (
+                admission.admission.dispatchStarted &&
+                !admission.admission.startRequestSettled &&
+                !this.#closing
+              ) {
+                await admission.waitForChange();
+              }
+            }
+            await observation.stopTask?.catch(() => undefined);
+            if (admission) this.#removeTurnObservation(admission);
+            if (!observation.readOnly) {
+              interactions?.settleTurn(turnId);
+            }
+            observation.dispose();
+            this.#removeTurnObservation(observation);
+          });
+        return observation;
+      } catch (error) {
         observation.dispose();
         if (admission) this.#removeTurnObservation(admission);
         else this.#removeTurnObservation(observation);
-        return;
+        throw error;
       }
-      const task = observation.start(attachment);
-      this.#replayPendingInteractions(sessionId, turnId, attachment, observation);
-      const interactions = this.#attachmentInteractions.get(sessionId);
-      void task
-        .then(
-          async () => {
-            if (
-              observation.finished ||
-              this.#observation(sessionId, turnId) !== observation ||
-              this.#discardedAttachments.has(attachment)
-            )
-              return;
-            const root = observation.terminalTurn;
-            const outcome = root ?? observation.terminalOutcome;
-            const runId = root?.runId ?? observation.runId;
-            if (outcome && runId) {
-              await this.#externalObservationContexts.get(sessionId)?.notifyTurnStatus?.({
-                sessionId,
-                turnId,
-                runId,
-                status: outcome.status,
-                ...(outcome.status === 'failed'
-                  ? { failureClass: outcome.failureClass ?? 'runtime_error' }
-                  : {}),
-              });
-            }
-          },
-          async (error: unknown) => {
-            if (
-              !this.#closing &&
-              !observation.finished &&
-              this.#observation(sessionId, turnId) === observation &&
-              !this.#discardedAttachments.has(attachment)
-            ) {
-              console.error('[acp] Attached Turn observation failed:', error);
-              const root = attachment.snapshot.rootTurn;
-              if (
-                root?.turnId === turnId &&
-                (observation.runId === undefined || root.runId === observation.runId) &&
-                !isRuntimeHostTerminalTurn(root)
-              ) {
-                observation.stopTask ??= this.#stopAttachedTurn(attachment, root);
-                void observation.stopTask.catch((stopError: unknown) => {
-                  console.error('[acp] Host Stop delivery failed:', stopError);
-                });
-              }
-              await this.#externalObservationContexts.get(sessionId)?.notifyTurnStatus?.({
-                sessionId,
-                turnId,
-                runId: root?.turnId === turnId ? root.runId : '',
-                status: 'observation_failed',
-              });
-            }
-          },
-        )
-        .catch((error: unknown) => {
-          console.error('[acp] Attached Turn status delivery failed:', error);
-        })
-        .finally(async () => {
-          if (admission) {
-            while (
-              admission.admission.dispatchStarted &&
-              !admission.admission.startRequestSettled &&
-              !this.#closing
-            ) {
-              await admission.waitForChange();
-            }
-          }
-          await observation.stopTask?.catch(() => undefined);
-          if (admission) this.#removeTurnObservation(admission);
-          interactions?.settleTurn(turnId);
-          observation.dispose();
-          this.#removeTurnObservation(observation);
-        });
-      return observation;
-    } catch (error) {
-      observation.dispose();
-      if (admission) this.#removeTurnObservation(admission);
-      else this.#removeTurnObservation(observation);
-      throw error;
-    }
+    })();
+    observation.startup = startup.then(
+      () => undefined,
+      () => undefined,
+    );
+    return startup;
   }
 
   #replayPendingInteractions(
@@ -2161,6 +2200,7 @@ export class AcpSessionRegistry {
       this.#historyReplayDelivery.delete(params.targetSessionId);
       this.#externalObservationContexts.delete(params.targetSessionId);
       this.#externalContextLeases.delete(params.targetSessionId);
+      this.#promptNotifications.delete(params.targetSessionId);
       for (const observation of this.#turnObservations.get(params.targetSessionId)?.values() ??
         []) {
         observation.cancelled = true;
@@ -2208,6 +2248,11 @@ export class AcpSessionRegistry {
         } else {
           this.#externalContextLeases.delete(sessionId);
           this.#externalObservationContexts.delete(sessionId);
+          for (const observation of this.#turnObservations.get(sessionId)?.values() ?? []) {
+            if (!(observation instanceof AcpAdmittedTurnObservation)) {
+              observation.readOnly = true;
+            }
+          }
         }
       },
       commit: () => {
@@ -2795,6 +2840,7 @@ export class AcpSessionRegistry {
     this.#domainObservations.clear();
     this.#externalObservationContexts.clear();
     this.#externalContextLeases.clear();
+    this.#promptNotifications.clear();
     for (const observations of this.#turnObservations.values()) {
       for (const observation of observations.values()) {
         if (!(observation instanceof AcpAdmittedTurnObservation)) observation.dispose();

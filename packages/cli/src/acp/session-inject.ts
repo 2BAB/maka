@@ -51,9 +51,6 @@
  *  - **Attachments are not published before admission.** `inject` maps content
  *    only, so a `resource_link` reaches the Host as a lazily read file
  *    reference, unlike `session/prompt`, which uploads before admitting.
- *  - **Assistant replies to a queued follow-up are not delivered live.** The
- *    turn starts after the prompt has returned, and this adapter only observes
- *    turns it has a client notification context for (`#adoptTurn`).
  */
 
 export const SESSION_INJECT_METHOD = 'session/inject';

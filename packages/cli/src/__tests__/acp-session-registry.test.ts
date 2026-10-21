@@ -6421,6 +6421,115 @@ describe('ACP Session registry', () => {
     await registry.dispose();
   });
 
+  test('streams live assistant replies for a queued follow-up turn after prompt completes without load or resume', async () => {
+    const sessionId = 'session-followup-live';
+    const subscription = new FakeSubscription(continuitySnapshot(sessionId));
+    const notifications: SessionNotification[] = [];
+    const replayNotifications: SessionNotification[] = [];
+    const turn1Started = deferred<void>();
+    const releaseTurn1 = deferred<void>();
+    let ids = 0;
+    const connection = fakeConnection({
+      request: async (operation, input) => {
+        if (operation === 'session.create') return catalogSession(sessionId);
+        if (operation === 'session.catalog.query')
+          return { kind: 'session', session: catalogSession(sessionId) };
+        if (operation === 'turn.start') {
+          const turnId = (input as { turnId: string }).turnId;
+          const turn1 = runningTurn(sessionId, turnId);
+          subscription.setRoot(turn1);
+          turn1Started.resolve();
+          void releaseTurn1.promise.then(() => {
+            subscription.appendText(turnId, turn1.runId, 'first reply', true);
+            subscription.publishTranscript([
+              {
+                type: 'assistant',
+                id: `message-${turnId}`,
+                turnId,
+                ts: 1,
+                text: 'first reply',
+                modelId: 'test-model',
+              },
+            ]);
+            subscription.setRoot(completedTurn(sessionId, turnId));
+          });
+          return {
+            kind: 'started',
+            turn: turn1,
+            skillInvocation: { loaded: [], failed: [], receipts: [] },
+          };
+        }
+        if (operation === 'turn.message.submit') return { disposition: 'followup' };
+        if (operation === 'turn.stop') return {};
+        throw new Error(`Unexpected operation ${operation}`);
+      },
+      openSessionSubscriptionOnce: async () => subscription,
+    });
+    Object.assign(connection, { hostEpoch: 'host-1' });
+    const registry = new AcpSessionRegistry({
+      connect: async () => connection,
+      newSessionId: () => sessionId,
+      newTurnId: () => `id-${++ids}`,
+    });
+    try {
+      await registry.create({ cwd: TEST_CWD, mcpServers: [] });
+      const prompting = registry.prompt(
+        { sessionId, prompt: [{ type: 'text', text: 'initial question' }] },
+        promptContext(notifications),
+      );
+      await turn1Started.promise;
+
+      const injected = await registry.inject({
+        sessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text: 'queued follow-up' }],
+      });
+      assert.deepEqual(injected, { messageId: 'id-2' });
+
+      releaseTurn1.resolve();
+      assert.deepEqual(await prompting, { stopReason: 'end_turn' });
+
+      const followupTurn = runningTurn(sessionId, 'turn-2');
+      subscription.setRoot(followupTurn);
+      subscription.appendText('turn-2', followupTurn.runId, 'follow-up ');
+      subscription.appendText('turn-2', followupTurn.runId, 'follow-up answer', true);
+
+      await waitFor(
+        () =>
+          notifications
+            .flatMap(({ update }) =>
+              update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text'
+                ? [update.content.text]
+                : [],
+            )
+            .join('') === 'first replyfollow-up answer',
+      );
+
+      subscription.publishTranscript([
+        {
+          type: 'assistant',
+          id: 'message-turn-2',
+          turnId: 'turn-2',
+          ts: 2,
+          text: 'follow-up answer',
+          modelId: 'test-model',
+        },
+      ]);
+      await registry.load(
+        { sessionId, cwd: TEST_CWD, mcpServers: [] },
+        promptContext(replayNotifications),
+      );
+      assert.deepEqual(
+        replayNotifications.filter(({ update }) => update.sessionUpdate === 'agent_message_chunk'),
+        [],
+      );
+      subscription.setRoot(completedTurn(sessionId, 'turn-2'));
+    } finally {
+      releaseTurn1.resolve();
+      await registry.dispose();
+    }
+  });
+
   test('rereads the Session after one revision conflict before retrying', async () => {
     const requests: Array<{ operation: string; input: unknown }> = [];
     let reads = 0;
