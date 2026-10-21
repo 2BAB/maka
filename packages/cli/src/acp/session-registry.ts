@@ -593,7 +593,9 @@ export class AcpSessionRegistry {
     );
     const connection = await this.#getConnection('turn.message.submit');
     const messageId = this.#newTurnId();
-    if (params.mode === 'steer' && !(await this.#turnIsRunning(connection, params.sessionId))) {
+    const steeredTurnId =
+      params.mode === 'steer' ? await this.#runningTurnId(connection, params.sessionId) : undefined;
+    if (params.mode === 'steer' && steeredTurnId === undefined) {
       // The proposal's precondition: a steer needs a turn to steer. Placement
       // `current_turn` against an idle Session makes the Host start a turn the
       // client never asked for and cannot observe, so refuse before admission.
@@ -611,9 +613,25 @@ export class AcpSessionRegistry {
         messageId,
         content,
         placement: placementFor(params.mode),
+        // Carried into admission: this read and the submit cannot be made into
+        // one operation from here, and only the Host can close that window.
+        ...(steeredTurnId === undefined ? {} : { expectedTurnId: steeredTurnId }),
       });
       disposition = result.disposition;
     } catch (error) {
+      // With the expectation attached, a Turn that ended in between answers
+      // `operation_conflict` — the same answer to the client as an idle steer.
+      if (
+        steeredTurnId !== undefined &&
+        error instanceof RuntimeHostOperationError &&
+        error.code === 'operation_conflict'
+      ) {
+        throw new RequestError(
+          INJECT_PRECONDITION_FAILED,
+          'Cannot steer a Session with no running turn',
+          { reason: 'no_running_turn' },
+        );
+      }
       throw requestErrorFromRuntimeHost(error, 'turn.message.submit');
     }
     if (disposition === 'blocked') {
@@ -703,22 +721,25 @@ export class AcpSessionRegistry {
   }
 
   /**
-   * Whether the Session currently has a turn to steer.
+   * The Turn a steer would target, when one is running.
    *
    * A live attachment already tracks the root turn, so a projection that says
    * "running" is trusted; anything else is re-read from the Host, because a
    * stale "idle" is exactly the case that would reject a legitimate steer. The
-   * read is not atomic with the submit that follows it — the turn can end in
-   * between, and only the Host could close that window.
+   * identity then travels with the submit, so admission re-checks it atomically
+   * instead of trusting this read.
    */
-  async #turnIsRunning(
+  async #runningTurnId(
     connection: AcpSessionRegistryConnection,
     sessionId: string,
-  ): Promise<boolean> {
+  ): Promise<string | undefined> {
     const attached = await this.#attachments.get(sessionId)?.catch(() => undefined);
-    const running = (root: TurnSnapshot | null | undefined): boolean =>
-      root !== null && root !== undefined && !isRuntimeHostTerminalTurn(root);
-    if (attached && running(attached.snapshot.rootTurn)) return true;
+    const running = (root: TurnSnapshot | null | undefined): string | undefined =>
+      root !== null && root !== undefined && !isRuntimeHostTerminalTurn(root)
+        ? root.turnId
+        : undefined;
+    const cached = attached ? running(attached.snapshot.rootTurn) : undefined;
+    if (cached !== undefined) return cached;
     return running((await this.#readSessionSnapshotOnce(connection, sessionId)).rootTurn);
   }
 

@@ -6266,6 +6266,57 @@ describe('ACP Session registry', () => {
     );
     const submit = requests.find(({ operation }) => operation === 'turn.message.submit');
     assert.equal((submit?.input as { placement?: string } | undefined)?.placement, 'current_turn');
+    // The identity travels with the submit so admission can re-check it; the
+    // pre-check alone would leave the turn-completion race open.
+    assert.equal(
+      (submit?.input as { expectedTurnId?: string } | undefined)?.expectedTurnId,
+      'turn-1',
+    );
+    await registry.dispose();
+  });
+
+  test('a steer whose turn ends during admission answers -32010', async () => {
+    const connection = fakeConnection({
+      request: async (operation) => {
+        if (operation === 'session.create') return catalogSession('session-race');
+        if (operation === 'turn.message.submit') {
+          // What the Host answers when the expected Turn is no longer running.
+          throw new RuntimeHostOperationError(
+            'turn.message.submit',
+            'operation_conflict',
+            'Session has no running Turn to steer',
+          );
+        }
+        return {};
+      },
+      openSessionSubscriptionOnce: async () =>
+        ({
+          snapshot: continuitySnapshot('session-race', {
+            rootTurn: runningTurn('session-race', 'turn-1'),
+          }),
+          close: async () => undefined,
+        }) as never,
+    });
+    Object.assign(connection, { hostEpoch: 'host-1' });
+    const registry = new AcpSessionRegistry({
+      connect: async () => connection,
+      newSessionId: () => 'session-race',
+    });
+    await registry.create({ cwd: TEST_CWD, mcpServers: [] });
+
+    await assert.rejects(
+      registry.inject({
+        sessionId: 'session-race',
+        mode: 'steer',
+        content: [{ type: 'text', text: 'too late' }],
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof RequestError);
+        assert.equal(error.code, -32010);
+        assert.deepEqual(error.data, { reason: 'no_running_turn' });
+        return true;
+      },
+    );
     await registry.dispose();
   });
 

@@ -1,0 +1,5 @@
+{
+  "epoch": 225,
+  "files": ["packages/runtime-host/src/protocol/message.ts"],
+  "reason": "Adds an optional turn.message.submit input field. A peer that never sends it sees no change: admission keeps today's rules, and no codec, output or stored shape moves."
+}
