@@ -6530,6 +6530,103 @@ describe('ACP Session registry', () => {
     }
   });
 
+  test('presents an interaction from the queued follow-up Turn to the client', async () => {
+    const sessionId = 'session-followup-interaction';
+    const subscription = new FakeSubscription(continuitySnapshot(sessionId));
+    const notifications: SessionNotification[] = [];
+    const turn1Started = deferred<void>();
+    const releaseTurn1 = deferred<void>();
+    let presented = 0;
+    let ids = 0;
+    const pendingQuestion = {
+      schemaVersion: 1,
+      interactionId: 'followup-question',
+      sessionId,
+      turnId: 'turn-2',
+      runId: 'run-turn-2',
+      revision: 1,
+      status: 'pending',
+      outcome: null,
+      request: {
+        kind: 'question',
+        toolUseId: 'followup-tool',
+        questions: [{ question: 'Continue?', options: [{ label: 'Yes' }] }],
+      },
+    } as const;
+    const connection = fakeConnection({
+      request: async (operation, input) => {
+        if (operation === 'session.create') return catalogSession(sessionId);
+        if (operation === 'session.catalog.query')
+          return { kind: 'session', session: catalogSession(sessionId) };
+        // Presentation re-queries the authority before opening a dialog.
+        if (operation === 'interaction.query') return pendingQuestion;
+        if (operation === 'turn.start') {
+          const turnId = (input as { turnId: string }).turnId;
+          const turn1 = runningTurn(sessionId, turnId);
+          subscription.setRoot(turn1);
+          turn1Started.resolve();
+          void releaseTurn1.promise.then(() => {
+            subscription.setRoot(completedTurn(sessionId, turnId));
+          });
+          return {
+            kind: 'started',
+            turn: turn1,
+            skillInvocation: { loaded: [], failed: [], receipts: [] },
+          };
+        }
+        if (operation === 'turn.message.submit') return { disposition: 'followup' };
+        if (operation === 'turn.stop') return {};
+        throw new Error(`Unexpected operation ${operation}`);
+      },
+      openSessionSubscriptionOnce: async () => subscription,
+    });
+    Object.assign(connection, { hostEpoch: 'host-1' });
+    const registry = new AcpSessionRegistry({
+      connect: async () => connection,
+      newSessionId: () => sessionId,
+      newTurnId: () => `id-${++ids}`,
+    });
+    const context = {
+      ...promptContext(notifications),
+      interactions: {
+        capabilities: { elicitation: { form: {} } },
+        createElicitation: async () => {
+          presented += 1;
+          return new Promise<never>(() => undefined);
+        },
+        requestPermission: async () => {
+          presented += 1;
+          return new Promise<never>(() => undefined);
+        },
+      },
+    };
+    try {
+      await registry.create({ cwd: TEST_CWD, mcpServers: [] });
+      const prompting = registry.prompt(
+        { sessionId, prompt: [{ type: 'text', text: 'initial question' }] },
+        context,
+      );
+      await turn1Started.promise;
+      await registry.inject({
+        sessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text: 'queued follow-up' }],
+      });
+      releaseTurn1.resolve();
+      assert.deepEqual(await prompting, { stopReason: 'end_turn' });
+
+      const followup = runningTurn(sessionId, 'turn-2');
+      subscription.setRoot(followup);
+      subscription.project({ interactions: { pending: [pendingQuestion] } });
+      // The Turn exists because this client queued it, so its permission
+      // requests are this client's to answer — otherwise the Turn stalls.
+      await waitFor(() => presented >= 1);
+    } finally {
+      releaseTurn1.resolve();
+      await registry.dispose();
+    }
+  });
+
   test('rereads the Session after one revision conflict before retrying', async () => {
     const requests: Array<{ operation: string; input: unknown }> = [];
     let reads = 0;

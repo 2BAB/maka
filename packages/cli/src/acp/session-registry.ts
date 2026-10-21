@@ -1627,9 +1627,9 @@ export class AcpSessionRegistry {
       onInteractionPending: (pending) => {
         if (attachment && this.#discardedAttachments.has(attachment)) return;
         const observation = this.#observation(sessionId, pending.turnId);
-        if (!interactions.fencesTurn(pending.turnId) && (!observation || observation.readOnly)) {
-          // An idle attachment can observe another client's Turn; it does not
-          // transfer that Turn's interaction authority to this ACP client.
+        if (!interactions.fencesTurn(pending.turnId) && !observation) {
+          // Nothing here observes that Turn, so its interaction authority
+          // belongs to whoever started it.
           return;
         }
         void interactions.pending(pending);
@@ -1637,8 +1637,7 @@ export class AcpSessionRegistry {
       onInteractionResolved: (pending) => {
         if (attachment && this.#discardedAttachments.has(attachment)) return;
         const observation = this.#observation(sessionId, pending.turnId);
-        if (!interactions.fencesTurn(pending.turnId) && (!observation || observation.readOnly))
-          return;
+        if (!interactions.fencesTurn(pending.turnId) && !observation) return;
         void interactions.resolved(pending);
       },
       onTranscriptSettlement: (turnId) => {
