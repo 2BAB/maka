@@ -74,6 +74,7 @@ import {
   type OperationInput,
   type OperationOutput,
   type SessionCatalogProjection,
+  type SessionContinuitySnapshot,
   type SessionMessageQueueProjection,
   type TurnSnapshot,
   type TurnResumePlan,
@@ -114,6 +115,7 @@ import {
 } from './session-configuration.js';
 import {
   AcpInjectInputError,
+  INJECT_PRECONDITION_FAILED,
   INJECT_NOT_FOUND,
   decodeInjectRequest,
   decodeRevokeRequest,
@@ -591,6 +593,16 @@ export class AcpSessionRegistry {
     );
     const connection = await this.#getConnection('turn.message.submit');
     const messageId = this.#newTurnId();
+    if (params.mode === 'steer' && !(await this.#turnIsRunning(connection, params.sessionId))) {
+      // The proposal's precondition: a steer needs a turn to steer. Placement
+      // `current_turn` against an idle Session makes the Host start a turn the
+      // client never asked for and cannot observe, so refuse before admission.
+      throw new RequestError(
+        INJECT_PRECONDITION_FAILED,
+        'Cannot steer a Session with no running turn',
+        { reason: 'no_running_turn' },
+      );
+    }
     let disposition;
     try {
       const result = await connection.request('turn.message.submit', {
@@ -664,27 +676,50 @@ export class AcpSessionRegistry {
     messageId: string,
   ): Promise<string | undefined> {
     const attached = await this.#attachments.get(sessionId)?.catch(() => undefined);
-    const queue = attached?.snapshot.queue ?? (await this.#readQueueOnce(connection, sessionId));
-    const pending = [...queue.steering, ...queue.followup];
-    return pending.find((entry) => entry.state === 'queued' && entry.messageId === messageId)
-      ?.entryId;
+    const cached = attached ? pendingEntryIdIn(attached.snapshot.queue, messageId) : undefined;
+    if (cached !== undefined) return cached;
+    // The Host refreshes the projected queue only after it answers the submit,
+    // so a read taken right after `session/inject` is expected to miss. Ask the
+    // Host before treating the id as unknown: a cached miss is not absence.
+    const fresh = await this.#readSessionSnapshotOnce(connection, sessionId);
+    return pendingEntryIdIn(fresh.queue, messageId);
   }
 
-  /** One queue read for a session owned by this connection but not attached. */
-  async #readQueueOnce(
+  /** One authoritative read for a session that may not be attached here. */
+  async #readSessionSnapshotOnce(
     connection: AcpSessionRegistryConnection,
     sessionId: string,
-  ): Promise<SessionMessageQueueProjection> {
+  ): Promise<SessionContinuitySnapshot> {
     const subscription = await connection
       .openSessionSubscriptionOnce({ sessionId, transcript: { kind: 'none' } })
       .catch((error: unknown) => {
         throw requestErrorFromRuntimeHost(error, 'subscription.open');
       });
     try {
-      return subscription.snapshot.queue;
+      return subscription.snapshot;
     } finally {
       void subscription.close().catch(() => undefined);
     }
+  }
+
+  /**
+   * Whether the Session currently has a turn to steer.
+   *
+   * A live attachment already tracks the root turn, so a projection that says
+   * "running" is trusted; anything else is re-read from the Host, because a
+   * stale "idle" is exactly the case that would reject a legitimate steer. The
+   * read is not atomic with the submit that follows it — the turn can end in
+   * between, and only the Host could close that window.
+   */
+  async #turnIsRunning(
+    connection: AcpSessionRegistryConnection,
+    sessionId: string,
+  ): Promise<boolean> {
+    const attached = await this.#attachments.get(sessionId)?.catch(() => undefined);
+    const running = (root: TurnSnapshot | null | undefined): boolean =>
+      root !== null && root !== undefined && !isRuntimeHostTerminalTurn(root);
+    if (attached && running(attached.snapshot.rootTurn)) return true;
+    return running((await this.#readSessionSnapshotOnce(connection, sessionId)).rootTurn);
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -2925,6 +2960,16 @@ export function requestErrorFromInjectInput(error: unknown): RequestError {
     { source: 'adapter', operation: 'session.inject', code: 'validation_failed' },
     'Session injection validation failed',
   );
+}
+
+/** The queued entry that carries `messageId`, if the projection still holds it. */
+function pendingEntryIdIn(
+  queue: SessionMessageQueueProjection,
+  messageId: string,
+): string | undefined {
+  const pending = [...queue.steering, ...queue.followup];
+  return pending.find((entry) => entry.state === 'queued' && entry.messageId === messageId)
+    ?.entryId;
 }
 
 /** Per the `session/inject` proposal: unknown or already-delivered message id. */

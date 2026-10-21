@@ -812,13 +812,13 @@ describe('Maka ACP stdio server', () => {
 
       send(3, 'session/inject', {
         sessionId,
-        mode: 'steer',
+        mode: 'queue',
         content: [{ type: 'text', text: 'one' }],
       });
       await waitFor(() => submissions.length === 1);
       send(4, 'session/inject', {
         sessionId,
-        mode: 'steer',
+        mode: 'queue',
         content: [{ type: 'text', text: 'two' }],
       });
       await waitFor(() => submissions.length === 2);

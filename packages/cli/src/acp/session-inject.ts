@@ -35,6 +35,25 @@
  * injected, and nothing else is attached to observe it. When multi-client
  * attach exists, the echo becomes meaningful and needs a delivery signal from
  * the Host rather than a guess.
+ *
+ * Known deviations from the proposal this implements, all deliberate and
+ * unaddressed here rather than silently different:
+ *
+ *  - **Error shape.** An unknown id and an already-delivered id both answer
+ *    -32002 without a `reason`; the draft splits them into `-32002
+ *    unknown_message_id` and `-32010 already_delivered`, and asks a repeated
+ *    revoke of an already-revoked id to succeed. The Host exposes no
+ *    "delivered" state (queue entries are `queued`/`in_flight`/`retracted`,
+ *    execution resolutions `inbox`/`pending`/`cancelled`/`not_admitted`/`owned`),
+ *    so splitting them means tracking injected ids in this adapter.
+ *  - **`session/cancel` discards pending injects.** The stop fence drops queued
+ *    steering and follow-up entries; the draft asks them to survive a cancel.
+ *  - **Attachments are not published before admission.** `inject` maps content
+ *    only, so a `resource_link` reaches the Host as a lazily read file
+ *    reference, unlike `session/prompt`, which uploads before admitting.
+ *  - **Assistant replies to a queued follow-up are not delivered live.** The
+ *    turn starts after the prompt has returned, and this adapter only observes
+ *    turns it has a client notification context for (`#adoptTurn`).
  */
 
 export const SESSION_INJECT_METHOD = 'session/inject';

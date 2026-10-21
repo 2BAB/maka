@@ -6189,6 +6189,86 @@ describe('ACP Session registry', () => {
     await registry.dispose();
   });
 
+  test('refuses to steer a Session with no running turn', async () => {
+    const requests: Array<{ operation: string; input: unknown }> = [];
+    const connection = fakeConnection({
+      request: async (operation, input) => {
+        requests.push({ operation, input });
+        if (operation === 'session.create') return catalogSession('session-idle');
+        return {};
+      },
+      openSessionSubscriptionOnce: async () =>
+        ({
+          snapshot: continuitySnapshot('session-idle'),
+          close: async () => undefined,
+        }) as never,
+    });
+    Object.assign(connection, { hostEpoch: 'host-1' });
+    const registry = new AcpSessionRegistry({
+      connect: async () => connection,
+      newSessionId: () => 'session-idle',
+    });
+    await registry.create({ cwd: TEST_CWD, mcpServers: [] });
+
+    await assert.rejects(
+      registry.inject({
+        sessionId: 'session-idle',
+        mode: 'steer',
+        content: [{ type: 'text', text: 'steer nothing' }],
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof RequestError);
+        assert.equal(error.code, -32010);
+        assert.deepEqual(error.data, { reason: 'no_running_turn' });
+        return true;
+      },
+    );
+    // The precondition is checked before admission: no hidden turn may start.
+    assert.deepEqual(
+      requests.filter(({ operation }) => operation === 'turn.message.submit'),
+      [],
+    );
+    await registry.dispose();
+  });
+
+  test('admits a steer into the running turn', async () => {
+    const requests: Array<{ operation: string; input: unknown }> = [];
+    const connection = fakeConnection({
+      request: async (operation, input) => {
+        requests.push({ operation, input });
+        if (operation === 'session.create') return catalogSession('session-live');
+        if (operation === 'turn.message.submit') return { disposition: 'steering' };
+        return {};
+      },
+      openSessionSubscriptionOnce: async () =>
+        ({
+          snapshot: continuitySnapshot('session-live', {
+            rootTurn: runningTurn('session-live', 'turn-1'),
+          }),
+          close: async () => undefined,
+        }) as never,
+    });
+    Object.assign(connection, { hostEpoch: 'host-1' });
+    const registry = new AcpSessionRegistry({
+      connect: async () => connection,
+      newSessionId: () => 'session-live',
+      newTurnId: () => 'message-1',
+    });
+    await registry.create({ cwd: TEST_CWD, mcpServers: [] });
+
+    assert.deepEqual(
+      await registry.inject({
+        sessionId: 'session-live',
+        mode: 'steer',
+        content: [{ type: 'text', text: 'steer the run' }],
+      }),
+      { messageId: 'message-1' },
+    );
+    const submit = requests.find(({ operation }) => operation === 'turn.message.submit');
+    assert.equal((submit?.input as { placement?: string } | undefined)?.placement, 'current_turn');
+    await registry.dispose();
+  });
+
   test('revoking an injected message retracts that entry and leaves the rest queued', async () => {
     const requests: Array<{ operation: string; input: unknown }> = [];
     const connection = fakeConnection({
