@@ -280,10 +280,12 @@ export function createAcpSessionConfigPatch(
         connectionSlug: context.connectionSlug,
         model: request.value,
       },
-      // A thinking level belongs to the old model: the TUI's `setModel` sends
-      // the same `null` (runtime-host-session-driver.ts), and keeping it here
-      // makes the Host refuse any target model that does not support it.
-      thinkingLevel: null,
+      // A thinking level belongs to the model it was chosen for: switching
+      // keeps it and the Host would refuse a target that cannot honour it, so
+      // the switch clears it. Selecting the model already in effect must not —
+      // a client re-sending `currentValue` would otherwise drop `high` to the
+      // default for no reason.
+      ...(request.value === context.currentModel ? {} : { thinkingLevel: null }),
     };
   }
   switch (request.configId) {

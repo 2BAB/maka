@@ -288,6 +288,16 @@ test('rejects a model the session cannot offer', () => {
       ),
     AcpSessionConfigInputError,
   );
+});
+
+test('re-selecting the current model keeps its thinking level', () => {
+  const context = {
+    connectionId: 'connection-1',
+    connectionSlug: 'openai-main',
+    currentModel: 'gpt-5',
+    models: [{ id: 'gpt-5' }],
+  } as const;
+  // A client re-sending `currentValue` must not drop `high` to the default.
   assert.deepEqual(
     createAcpSessionConfigPatch(
       { sessionId: 'session-1', configId: 'model', value: 'gpt-5' },
@@ -300,7 +310,6 @@ test('rejects a model the session cannot offer', () => {
         connectionSlug: 'openai-main',
         model: 'gpt-5',
       },
-      thinkingLevel: null,
     },
   );
 });
