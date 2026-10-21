@@ -71,7 +71,7 @@ describe('ACP Session event mapper', () => {
     });
   }
 
-  test('replay preserves non-user origin and keeps steered rows under their steering id', async () => {
+  test('replay preserves non-user origin and keeps steered rows under the id the client was given', async () => {
     const notifications: SessionNotification[] = [];
     const mapper = eventMapper(notifications);
     await mapper.acceptHistoricalMessage({
@@ -101,10 +101,10 @@ describe('ACP Session event mapper', () => {
           _meta: { '_maka/origin': { kind: 'scheduled_task', scheduledTaskId: 'schedule-1' } },
         },
         {
-          // A steered message is the user speaking, and `session/inject` already
-          // gave the client this id — replay must not drop it.
+          // A steered message is the user speaking, and `session/inject` gave the
+          // client the row id — replay must not substitute the runtime event id.
           sessionUpdate: 'user_message_chunk',
-          messageId: 'steering-event',
+          messageId: 'steering',
           content: { type: 'text', text: 'Continue' },
         },
       ],

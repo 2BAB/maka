@@ -151,9 +151,12 @@ export class AcpSessionEventMapper {
             update: {
               sessionUpdate: 'user_message_chunk',
               content: { type: 'text', text },
-              // The steering event id is the id `session/inject` returned;
-              // the stored row may carry its own id.
-              messageId: message.steeringEventId ?? message.id,
+              // The row id is the identity the client already holds: the Host
+              // projects it from the submitted message id (`refs.providerEventId`
+              // through `stableMessageId`), steering rows included.
+              // `steeringEventId` is the runtime event that carried the text — a
+              // different id, and not the one `session/inject` answered with.
+              messageId: message.id,
               ...(attachments.length || message.origin
                 ? {
                     _meta: {
